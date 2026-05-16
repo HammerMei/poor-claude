@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +20,9 @@ class DaemonState:
 
 def write_state(path: Path, state: DaemonState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": state.pid, "address": state.address}), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps({"pid": state.pid, "address": state.address}), encoding="utf-8")
+    tmp.replace(path)
 
 
 def read_state(path: Path) -> DaemonState | None:

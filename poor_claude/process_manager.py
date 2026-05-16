@@ -140,7 +140,11 @@ def _terminate_process(process: subprocess.Popen, *, timeout_seconds: float) -> 
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             process.kill()
-        process.wait(timeout=timeout_seconds)
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # Process is in an uninterruptible state (D-state); nothing more we can do.
+            pass
     finally:
         if process.poll() is not None:
             _close_pty(process)

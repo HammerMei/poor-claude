@@ -352,6 +352,14 @@ def _should_cleanup_project_settings_locked(state: ControlState, workdir: str) -
 def _wait_for_response(state: ControlState, session, request, *, timeout_seconds: int) -> str:
     deadline = time.time() + timeout_seconds
     candidates = transcript_candidates(session_id=session.session_id, workdir=session.workdir)
+    # Snapshot current transcript sizes so we seek directly to the right position
+    # rather than relying on the 1 MB tail-read, which fails for long sessions.
+    transcript_offsets: dict[str, int] = {}
+    for candidate in candidates:
+        try:
+            transcript_offsets[str(candidate)] = candidate.stat().st_size
+        except OSError:
+            transcript_offsets[str(candidate)] = 0
     transcript_quiet_seconds = 0.5
     stable_transcript_response = None
     stable_transcript_signature = None
@@ -378,7 +386,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
         transcript_stop_reason = None
         transcript_signature = None
         for candidate in candidates:
-            transcript_record = read_response_record_after_request_from_file(candidate, request_id=request.request_id)
+            transcript_record = read_response_record_after_request_from_file(
+                candidate,
+                request_id=request.request_id,
+                start_offset=transcript_offsets.get(str(candidate), 0),
+            )
             if transcript_record is not None:
                 transcript_response = transcript_record.text
                 transcript_stop_reason = transcript_record.stop_reason
@@ -414,6 +426,10 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
             for candidate in refreshed_candidates:
                 if candidate not in candidates:
                     candidates.append(candidate)
+                    try:
+                        transcript_offsets[str(candidate)] = candidate.stat().st_size
+                    except OSError:
+                        transcript_offsets[str(candidate)] = 0
             next_candidate_refresh = time.time() + 2.0
 
         remaining = deadline - time.time()
@@ -486,6 +502,7 @@ def make_handler(state: ControlState):
             length = int(self.headers.get("Content-Length", "0"))
             if length == 0:
                 return {}
+            length = max(0, min(length, 64 * 1024 * 1024))  # cap at 64 MB
             return json.loads(self.rfile.read(length).decode("utf-8"))
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
@@ -672,7 +689,9 @@ def make_handler(state: ControlState):
             try:
                 payload = self._read_json()
                 session_id = payload.get("session_id")
-                prompt = payload["prompt"]
+                prompt = payload.get("prompt")
+                if prompt is None:
+                    raise RuntimeError("missing required field: prompt")
                 timeout_seconds = int(payload.get("timeout_seconds", 300))
                 wait_for_response = bool(payload.get("wait_for_response", False))
                 ttl_seconds = payload.get("ttl_seconds")

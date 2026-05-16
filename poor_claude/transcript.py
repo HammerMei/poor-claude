@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
-MAX_TRANSCRIPT_READ_BYTES = 1024 * 1024
+MAX_TRANSCRIPT_READ_BYTES = 1024 * 1024  # fallback when no offset is known
 
 
 @dataclass(frozen=True)
@@ -45,19 +45,35 @@ def read_response_after_request(
     return None
 
 
-def read_response_after_request_from_file(path: Path, *, request_id: str) -> str | None:
-    response = read_response_record_after_request_from_file(path, request_id=request_id)
+def read_response_after_request_from_file(
+    path: Path, *, request_id: str, start_offset: int = 0
+) -> str | None:
+    response = read_response_record_after_request_from_file(
+        path, request_id=request_id, start_offset=start_offset
+    )
     return None if response is None else response.text
 
 
-def read_response_record_after_request_from_file(path: Path, *, request_id: str) -> TranscriptResponse | None:
+def read_response_record_after_request_from_file(
+    path: Path, *, request_id: str, start_offset: int = 0
+) -> TranscriptResponse | None:
+    """Read the assistant response that follows a poor-claude request marker.
+
+    ``start_offset`` is the byte offset of the transcript file at the time the
+    request was sent.  Seeking directly there avoids the 1 MB tail-read limit
+    that would otherwise cause responses to be missed in long-running sessions.
+    When unknown (e.g. older call sites), pass 0 to fall back to the tail-read.
+    """
     if not path.exists():
         return None
     seen_request = False
     latest_response = None
     latest_stop_reason = None
     try:
-        lines = _read_recent_text(path, max_bytes=MAX_TRANSCRIPT_READ_BYTES).splitlines()
+        if start_offset > 0:
+            lines = _read_from_offset(path, start_offset=start_offset).splitlines()
+        else:
+            lines = _read_recent_text(path, max_bytes=MAX_TRANSCRIPT_READ_BYTES).splitlines()
     except OSError:
         return None
     for line in lines:
@@ -82,6 +98,14 @@ def read_response_record_after_request_from_file(path: Path, *, request_id: str)
     if latest_response is None:
         return None
     return TranscriptResponse(text=latest_response, stop_reason=latest_stop_reason)
+
+
+def _read_from_offset(path: Path, *, start_offset: int) -> str:
+    """Read from a known byte offset to EOF — no size limit."""
+    with path.open("rb") as handle:
+        handle.seek(max(0, start_offset))
+        data = handle.read()
+    return data.decode("utf-8", errors="replace")
 
 
 def _read_recent_text(path: Path, *, max_bytes: int) -> str:

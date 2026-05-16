@@ -93,26 +93,35 @@ def launch_claude(spec: ClaudeLaunchSpec) -> subprocess.Popen:
             raise
         os.close(slave_fd)
         process._poor_claude_pty_master_fd = master_fd  # type: ignore[attr-defined]
-        if spec.stdout_path:
-            thread = threading.Thread(
-                target=_drain_pty_to_log,
-                args=(master_fd, spec.stdout_path, spec.auto_accept_workspace_trust),
-                daemon=True,
-            )
-            thread.start()
-            process._poor_claude_pty_thread = thread  # type: ignore[attr-defined]
+        # Always drain the PTY master FD — if the kernel buffer fills, the child
+        # process blocks on any write and the session stalls permanently.
+        thread = threading.Thread(
+            target=_drain_pty_to_log,
+            args=(master_fd, spec.stdout_path, spec.auto_accept_workspace_trust),
+            daemon=True,
+        )
+        thread.start()
+        process._poor_claude_pty_thread = thread  # type: ignore[attr-defined]
         return process
 
-    stdout_handle = spec.stdout_path.open("ab") if spec.stdout_path else subprocess.DEVNULL
-    stderr_handle = spec.stderr_path.open("ab") if spec.stderr_path else subprocess.DEVNULL
-    return subprocess.Popen(  # noqa: S603 - intentional local Claude Code process launch
-        build_claude_command(spec),
-        cwd=spec.workdir,
-        stdin=subprocess.DEVNULL,
-        stdout=stdout_handle,
-        stderr=stderr_handle,
-        start_new_session=True,
-    )
+    # Open file handles only to pass FDs into Popen; close Python objects immediately
+    # after the call since Popen duplicates the underlying FDs via fork/exec.
+    stdout_cm = spec.stdout_path.open("ab") if spec.stdout_path else None
+    stderr_cm = spec.stderr_path.open("ab") if spec.stderr_path else None
+    try:
+        return subprocess.Popen(  # noqa: S603 - intentional local Claude Code process launch
+            build_claude_command(spec),
+            cwd=spec.workdir,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_cm if stdout_cm is not None else subprocess.DEVNULL,
+            stderr=stderr_cm if stderr_cm is not None else subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        if stdout_cm is not None:
+            stdout_cm.close()
+        if stderr_cm is not None:
+            stderr_cm.close()
 
 
 def _parse_tools_metadata(raw: str) -> list[str] | None:
@@ -272,12 +281,13 @@ def cleanup_project_mcp_config(project_dir: Path) -> None:
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\)|[()][A-Za-z0-9]|[=>][0-9]*[A-Za-z]?)")
 
 
-def _drain_pty_to_log(master_fd: int, log_path: Path, auto_accept_startup_prompts: bool = False) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+def _drain_pty_to_log(master_fd: int, log_path: Path | None, auto_accept_startup_prompts: bool = False) -> None:
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
     recent = ""
     accepted: set[str] = set()
     startup_deadline = time.monotonic() + 30.0
-    with log_path.open("ab") as handle:
+    with (log_path.open("ab") if log_path is not None else open(os.devnull, "wb")) as handle:  # noqa: WPS515
         while True:
             try:
                 chunk = os.read(master_fd, 4096)

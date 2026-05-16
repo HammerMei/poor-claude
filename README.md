@@ -45,20 +45,28 @@ claude-no-p "your prompt"
 
 ## Installation
 
-### Via uv (recommended)
-
 ```bash
-# Install into your environment
-uv pip install .
-
-# Or install a stable wrapper script to ~/.local/bin
-scripts/install-claude-no-p-wrapper
+# Clone the repo, then run the install script:
+git clone https://github.com/your-org/poor-claude.git
+cd poor-claude
+scripts/install.sh
 ```
 
-### Via pip
+This installs the package into `~/.poor-claude/venv/` and creates a
+`claude-no-p` wrapper at `~/.local/bin/claude-no-p`.
 
 ```bash
-pip install .
+# Custom install location
+scripts/install.sh --bin-dir /usr/local/bin
+
+# Update an existing install
+scripts/install.sh --upgrade
+```
+
+Make sure `~/.local/bin` is on your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 ```
 
 ## Quick start

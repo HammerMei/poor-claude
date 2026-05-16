@@ -74,7 +74,15 @@ def _parse_rule(rule: str) -> tuple[str, str | None]:
 
 
 def _primary_input_string(tool_name: str, tool_input: dict) -> str | None:
-    """Return the string to match against a permission rule pattern."""
+    """Return the string to match against a permission rule pattern.
+
+    Returns None for tools without a natural primary string input (e.g. Agent,
+    TodoRead) or for tools not yet listed here.  A rule like ``ToolName`` (no
+    pattern) still matches via _tool_is_allowed's ``pattern is None`` path, so
+    bare-name allow/deny rules work for every tool.  Pattern rules (e.g.
+    ``ToolName(glob)``) only work for tools whose primary input is returned here;
+    for unknown tools with a pattern, the rule silently never matches.
+    """
     if tool_name == "Bash":
         return tool_input.get("command")
     if tool_name in ("Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"):
@@ -83,12 +91,16 @@ def _primary_input_string(tool_name: str, tool_input: dict) -> str | None:
             or tool_input.get("path")
             or tool_input.get("pattern")
         )
+    if tool_name in ("NotebookEdit", "NotebookRead"):
+        return tool_input.get("notebook_path")
     if tool_name == "Skill":
         return tool_input.get("skill") or tool_input.get("name")
     if tool_name == "WebFetch":
         return tool_input.get("url")
     if tool_name == "WebSearch":
         return tool_input.get("query")
+    if tool_name == "Agent":
+        return tool_input.get("subagent_type")
     return None
 
 

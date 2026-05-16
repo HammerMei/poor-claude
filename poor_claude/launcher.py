@@ -256,6 +256,42 @@ def _merge_project_mcp_config(*, path: Path, config: dict) -> None:
     path.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def cleanup_project_mcp_config(project_dir: Path) -> None:
+    """Remove poor-claude-owned MCP server entries from the project's .mcp.json.
+
+    Called on session teardown so we don't leave stale entries behind in the
+    project's version-controlled .mcp.json.
+    """
+    path = project_dir / ".mcp.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return
+    cleaned = {
+        name: srv
+        for name, srv in servers.items()
+        if not (
+            isinstance(srv, dict)
+            and isinstance(srv.get("env"), dict)
+            and srv["env"].get("POOR_CLAUDE_OWNED") == "1"
+        )
+    }
+    if cleaned == servers:
+        return  # nothing owned by poor-claude, nothing to remove
+    if not cleaned:
+        path.unlink(missing_ok=True)
+        return
+    data["mcpServers"] = cleaned
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\)|[()][A-Za-z0-9]|[=>][0-9]*[A-Za-z]?)")
 
 

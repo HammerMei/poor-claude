@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,7 +37,7 @@ class SessionRecord:
     created_at: float
     last_request_finished_at: float | None = None
     active_request: PendingRequest | None = None
-    completed_request_ids: set[str] = field(default_factory=set)
+    completed_request_ids: deque[str] = field(default_factory=lambda: deque(maxlen=256))
     metadata: dict[str, str] = field(default_factory=dict)
 
     def is_idle_expired(self, now: float | None = None) -> bool:
@@ -155,7 +156,7 @@ class SessionRegistry:
             raise RuntimeError("request id mismatch")
         request.response = response
         record.active_request = None
-        record.completed_request_ids.add(request.request_id)
+        record.completed_request_ids.append(request.request_id)
         record.last_request_finished_at = time.time() if now is None else now
         return request
 
@@ -173,7 +174,7 @@ class SessionRegistry:
         if request.request_id != request_id:
             raise RuntimeError("request id mismatch")
         record.active_request = None
-        record.completed_request_ids.add(request.request_id)
+        record.completed_request_ids.append(request.request_id)
         record.last_request_finished_at = time.time() if now is None else now
         return request
 

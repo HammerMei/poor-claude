@@ -222,7 +222,11 @@ def write_merged_settings(
     policy_file: Path | None = None,
 ) -> GeneratedSettings:
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"claude-settings.merged.{uuid.uuid4().hex}.json"
+    path = directory / "claude-settings.merged.json"
+    # Remove any stale uuid-named merged settings files left by older versions.
+    for old in directory.glob("claude-settings.merged.*.json"):
+        if old != path:
+            old.unlink(missing_ok=True)
     base = read_settings(base_settings_path_or_json)
     data = merge_settings(
         base,

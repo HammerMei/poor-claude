@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from poor_claude.daemon import DaemonState, write_state
-from poor_claude.launcher import build_claude_command, prepare_launch_spec
+from poor_claude.launcher import build_claude_command, cleanup_project_mcp_config, prepare_launch_spec
 from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
 from poor_claude.settings import cleanup_project_local_settings
@@ -274,6 +274,7 @@ def _prune_sessions(state: ControlState, *, now: float | None = None) -> list[st
         for workdir in cleanup_workdirs:
             if _should_cleanup_project_settings_locked(state, workdir):
                 cleanup_project_local_settings(Path(workdir))
+                cleanup_project_mcp_config(Path(workdir))
     return removed
 
 
@@ -662,6 +663,7 @@ def make_handler(state: ControlState):
                 state.mcp_router.remove_route(existing.route_key)
                 if _should_cleanup_project_settings_locked(state, existing.workdir):
                     cleanup_project_local_settings(Path(existing.workdir))
+                    cleanup_project_mcp_config(Path(existing.workdir))
                 state.condition.notify_all()
             self._send_json(200, {"ok": True, "session_id": session_id})
 
@@ -696,14 +698,19 @@ def make_handler(state: ControlState):
                         prompt=str(prompt),
                         timeout_seconds=timeout_seconds,
                     )
-                    notification = asyncio.run(
-                        state.mcp_router.route_prompt(
-                            route_key=session.route_key,
-                            session_id=session.session_id,
-                            request_id=request.request_id,
-                            prompt=str(prompt),
-                        )
+                    _route_key = session.route_key
+                    _session_id_for_prompt = session.session_id
+                    _request_id = request.request_id
+                # Release the lock before the async MCP call so other threads
+                # (e.g. the Stop hook handler) are not blocked while we wait.
+                notification = asyncio.run(
+                    state.mcp_router.route_prompt(
+                        route_key=_route_key,
+                        session_id=_session_id_for_prompt,
+                        request_id=_request_id,
+                        prompt=str(prompt),
                     )
+                )
                 if wait_for_response:
                     response = _wait_for_response(state, session, request, timeout_seconds=timeout_seconds)
                     resp_body: dict[str, Any] = {
@@ -806,6 +813,7 @@ def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
             with state.lock:
                 for workdir in cleanup_workdirs:
                     cleanup_project_local_settings(Path(workdir))
+                    cleanup_project_mcp_config(Path(workdir))
             remove_state()
         if server_close_error is not None:
             raise server_close_error

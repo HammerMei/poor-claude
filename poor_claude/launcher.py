@@ -6,62 +6,96 @@ import subprocess
 import json
 import os
 import pty
+import re
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from poor_claude.mcp_router import CHANNEL_NAME
 from poor_claude.mcp_validation import build_mcp_config
-from poor_claude.settings import write_merged_settings
+from poor_claude.settings import cleanup_project_local_settings, write_merged_settings
 from poor_claude.session import SessionRecord
 
 
 @dataclass(frozen=True)
 class ClaudeLaunchSpec:
     session_id: str
-    settings_path: Path
+    settings_path: Path | None
     mcp_config_path: Path
     channel_name: str
     workdir: Path
-    dangerously_skip_permissions: bool = False
+    resume: bool = False
+    permission_mode: str = "default"
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     use_pty: bool = True
     auto_accept_workspace_trust: bool = False
+    effort: str = "medium"
+    model: str | None = None
+    append_system_prompt: str | None = None
+    system_prompt: str | None = None
+    tools: list[str] | None = None
+    add_dirs: list[str] | None = None
 
 
 def build_claude_command(spec: ClaudeLaunchSpec) -> list[str]:
     command = [
         "claude",
-        "--session-id",
+        "--resume" if spec.resume else "--session-id",
         spec.session_id,
-        "--settings",
-        str(spec.settings_path),
+        "--effort",
+        spec.effort,
         "--dangerously-load-development-channels",
         f"server:{spec.channel_name}",
     ]
-    if spec.dangerously_skip_permissions:
-        command.append("--dangerously-skip-permissions")
+    if spec.settings_path is not None:
+        command[3:3] = ["--settings", str(spec.settings_path)]
+    if spec.model:
+        command.append("--model")
+        command.append(spec.model)
+    for d in spec.add_dirs or []:
+        command += ["--add-dir", d]
+    if spec.tools is not None:
+        command.append("--tools")
+        if spec.tools:
+            command.extend(spec.tools)
+        else:
+            command.append("")  # --tools "" disables all tools
+    if spec.system_prompt:
+        command.append("--system-prompt")
+        command.append(spec.system_prompt)
+    if spec.append_system_prompt:
+        command.append("--append-system-prompt")
+        command.append(spec.append_system_prompt)
+    if spec.permission_mode and spec.permission_mode != "default":
+        command.append("--permission-mode")
+        command.append(spec.permission_mode)
     return command
 
 
 def launch_claude(spec: ClaudeLaunchSpec) -> subprocess.Popen:
     if spec.use_pty:
         master_fd, slave_fd = pty.openpty()
-        process = subprocess.Popen(  # noqa: S603 - intentional local Claude Code process launch
-            build_claude_command(spec),
-            cwd=spec.workdir,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(  # noqa: S603 - intentional local Claude Code process launch
+                build_claude_command(spec),
+                cwd=spec.workdir,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+            )
+        except Exception:
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise
         os.close(slave_fd)
         process._poor_claude_pty_master_fd = master_fd  # type: ignore[attr-defined]
         if spec.stdout_path:
             thread = threading.Thread(
                 target=_drain_pty_to_log,
-                args=(master_fd, spec.stdout_path),
+                args=(master_fd, spec.stdout_path, spec.auto_accept_workspace_trust),
                 daemon=True,
             )
             thread.start()
@@ -80,6 +114,36 @@ def launch_claude(spec: ClaudeLaunchSpec) -> subprocess.Popen:
     )
 
 
+def _parse_tools_metadata(raw: str) -> list[str] | None:
+    """Parse tools metadata string → list for ClaudeLaunchSpec, or None if not set.
+
+    Returns None when the caller did not restrict the tool set (Claude uses its default).
+    Returns a list (possibly empty, meaning --tools "") when the caller set --tools.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(t) for t in data if isinstance(t, str)]
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _parse_json_list_metadata(raw: str) -> list[str] | None:
+    """Parse a JSON-list metadata string → list, or None if not set."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(t) for t in data if isinstance(t, str)]
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 def prepare_launch_spec(
     *,
     session: SessionRecord,
@@ -88,10 +152,34 @@ def prepare_launch_spec(
 ) -> ClaudeLaunchSpec:
     """Prepare local merged settings and a launch spec for one session route."""
     route_dir = state_dir / "routes" / _safe_route_name(session.route_key)
+    # Strip any poor-claude hooks that may have been written to the project's
+    # settings.local.json by a previous run, so we don't duplicate them.
+    cleanup_project_local_settings(Path(session.workdir))
+    # Only inject pretool hook in default permission mode. In bypassPermissions mode
+    # the hook would just return 0 on every call anyway, so skip the subprocess overhead.
+    # (Other non-default modes like auto/acceptEdits still need the hook — they still
+    # run in default mode from the hook's perspective until the mode is confirmed
+    # in the payload, so we inject it and let the hook's mode check handle it.)
+    permission_mode = session.metadata.get("permission_mode") or "default"
+    include_pretool_hook = permission_mode != "bypassPermissions"
+    # Write allow/disallow rules to a fixed path baked into the hook command once at
+    # launch. The file is rewritten on every request so rule changes take effect
+    # immediately — the hook reads it fresh on each invocation, no restart needed.
+    policy_file = route_dir / "tools-policy.json"
+    allowed_tools_raw = session.metadata.get("allowed_tools") or ""
+    disallowed_tools_raw = session.metadata.get("disallowed_tools") or ""
+    allow_rules: list[str] = json.loads(allowed_tools_raw) if allowed_tools_raw else []
+    disallow_rules: list[str] = json.loads(disallowed_tools_raw) if disallowed_tools_raw else []
+    route_dir.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(
+        json.dumps({"allow": allow_rules, "disallow": disallow_rules}), encoding="utf-8"
+    )
     merged = write_merged_settings(
         directory=route_dir,
         callback_url=f"{callback_base_url.rstrip('/')}/hook/stop",
         base_settings_path_or_json=session.metadata.get("settings_path") or None,
+        include_pretool_hook=include_pretool_hook,
+        policy_file=policy_file,
     )
     mcp_log_path = route_dir / "mcp-stdio.log"
     stdout_path = route_dir / "claude.stdout.log"
@@ -106,6 +194,7 @@ def prepare_launch_spec(
         ),
     )
     session.metadata["merged_settings_path"] = str(merged.path)
+    session.metadata["policy_file"] = str(policy_file)
     session.metadata["mcp_config_path"] = str(mcp_config_path)
     session.metadata["mcp_log_path"] = str(mcp_log_path)
     session.metadata["claude_stdout_path"] = str(stdout_path)
@@ -117,10 +206,17 @@ def prepare_launch_spec(
         mcp_config_path=mcp_config_path,
         channel_name=CHANNEL_NAME,
         workdir=Path(session.workdir),
-        dangerously_skip_permissions=session.metadata.get("dangerously_skip_permissions") == "True",
+        resume=session.metadata.get("resume_on_launch") == "True",
+        permission_mode=session.metadata.get("permission_mode") or "default",
         stdout_path=stdout_path,
         stderr_path=stderr_path,
         auto_accept_workspace_trust=session.metadata.get("auto_accept_workspace_trust") == "True",
+        effort=session.metadata.get("effort") or "medium",
+        model=session.metadata.get("model") or None,
+        append_system_prompt=session.metadata.get("append_system_prompt") or None,
+        system_prompt=session.metadata.get("system_prompt") or None,
+        tools=_parse_tools_metadata(session.metadata.get("tools") or ""),
+        add_dirs=_parse_json_list_metadata(session.metadata.get("add_dirs") or ""),
     )
 
 
@@ -160,8 +256,14 @@ def _merge_project_mcp_config(*, path: Path, config: dict) -> None:
     path.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _drain_pty_to_log(master_fd: int, log_path: Path) -> None:
+ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\)|[()][A-Za-z0-9]|[=>][0-9]*[A-Za-z]?)")
+
+
+def _drain_pty_to_log(master_fd: int, log_path: Path, auto_accept_startup_prompts: bool = False) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    recent = ""
+    accepted: set[str] = set()
+    startup_deadline = time.monotonic() + 30.0
     with log_path.open("ab") as handle:
         while True:
             try:
@@ -172,3 +274,59 @@ def _drain_pty_to_log(master_fd: int, log_path: Path) -> None:
                 return
             handle.write(chunk)
             handle.flush()
+            if auto_accept_startup_prompts:
+                recent = (recent + chunk.decode("utf-8", errors="ignore"))[-12000:]
+                plain_recent = _plain_terminal_text(recent)
+                if time.monotonic() > startup_deadline or "listening for channel messages" in plain_recent:
+                    auto_accept_startup_prompts = False
+                    continue
+                keys, prompt_name = _startup_acceptance_keys(recent, accepted)
+                if keys is not None and prompt_name is not None:
+                    try:
+                        handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
+                        handle.flush()
+                        os.write(master_fd, keys)
+                        accepted.add(prompt_name)
+                    except OSError:
+                        return
+
+
+def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) -> tuple[bytes | None, str | None]:
+    accepted = accepted or set()
+    text = _plain_terminal_text(raw_text)
+    if (
+        "warning" in text
+        and "bypass permissions" in text
+        and "1. no" in text
+        and "exit" in text
+        and "2. yes" in text
+        and "accept" in text
+        and "enter to confirm" in text
+    ):
+        if "bypass-permissions" not in accepted:
+            return b"\x1b[B\r", "bypass-permissions"
+    if (
+        "new mcp server found" in text
+        and "poor-claude" in text
+        and "1. use this and all future" in text
+        and "2. use this mcp server" in text
+        and "3. continue without" in text
+        and "enter to confirm" in text
+    ):
+        if "mcp-server" not in accepted:
+            return b"\x1b[B\r", "mcp-server"
+    if (
+        "warning" in text
+        and "loading development channels" in text
+        and "1. i am using this for local development" in text
+        and "2. exit" in text
+        and "enter to confirm" in text
+    ):
+        if "development-channels" not in accepted:
+            return b"\r", "development-channels"
+    return None, None
+
+
+def _plain_terminal_text(raw_text: str) -> str:
+    without_ansi = ANSI_RE.sub(" ", raw_text)
+    return " ".join(without_ansi.lower().split())

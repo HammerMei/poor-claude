@@ -24,12 +24,16 @@ class IdentityValidationResult:
 
 
 def build_dump_settings(*, output_path: Path) -> dict:
+    python_code = (
+        "from pathlib import Path; "
+        "import sys; "
+        "Path(sys.argv[1]).write_text(sys.stdin.read(), encoding='utf-8')"
+    )
     command = " ".join(
         [
             shlex.quote(sys.executable),
-            "-m",
-            "poor_claude.hooks.dump_stop_hook",
-            "--output",
+            "-c",
+            shlex.quote(python_code),
             shlex.quote(str(output_path)),
         ]
     )

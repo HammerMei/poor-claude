@@ -125,6 +125,7 @@ def post_callback(callback_url: str, payload: StopHookPayload) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--poor-claude-managed", action="store_true")
     parser.add_argument("--callback-url", required=True)
     args = parser.parse_args(argv)
     try:

@@ -9,7 +9,9 @@ from typing import Any
 
 
 class HttpClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload
 
 
 def request_json(
@@ -31,7 +33,11 @@ def request_json(
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8")
-        raise HttpClientError(f"{method} {url} failed: {exc.code} {detail}") from exc
+        try:
+            payload = json.loads(detail)
+        except json.JSONDecodeError:
+            payload = None
+        raise HttpClientError(f"{method} {url} failed: {exc.code} {detail}", payload=payload) from exc
     if raw == "":
         return {}
     return json.loads(raw)

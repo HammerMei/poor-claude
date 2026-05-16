@@ -1,4 +1,9 @@
 .poor-claude-validation/
 .pytest_cache/
+.venv/
 __pycache__/
 *.pyc
+.claude/
+.mcp.json
+.coverage
+*.egg-info/

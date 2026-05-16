@@ -1,11 +1,15 @@
 import json
 import sys
+from pathlib import Path
 
 from poor_claude.settings import (
     build_settings,
+    cleanup_project_local_settings,
     merge_settings,
     read_settings,
+    strip_poor_claude_managed_settings,
     stop_hook_command,
+    write_project_local_settings,
     write_merged_settings,
     write_settings,
 )
@@ -15,16 +19,73 @@ def test_stop_hook_command_uses_local_module() -> None:
     command = stop_hook_command("http://127.0.0.1:1234/hook/stop")
     assert sys.executable in command
     assert "-m poor_claude.hooks.stop_hook" in command
+    assert "--poor-claude-managed" in command
     assert "PYTHONPATH=" in command
     assert "http://127.0.0.1:1234/hook/stop" in command
 
 
 def test_build_settings_contains_stop_hook_only() -> None:
     settings = build_settings("http://127.0.0.1:1234/hook/stop")
-    assert list(settings["hooks"].keys()) == ["Stop"]
+    assert "permissions" not in settings
+    assert list(settings["hooks"].keys()) == ["PreToolUse", "Stop"]
     hook = settings["hooks"]["Stop"][0]["hooks"][0]
+    assert settings["hooks"]["PreToolUse"][0]["matcher"] == ".*"
+    assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"] == "command"
+    assert "poor_claude.hooks.pretool_hook" in settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--poor-claude-managed" in settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert hook["type"] == "command"
     assert "poor_claude.hooks.stop_hook" in hook["command"]
+
+
+def test_build_settings_omits_pretool_hook_when_not_requested() -> None:
+    settings = build_settings("http://127.0.0.1:1234/hook/stop", include_pretool_hook=False)
+    assert "PreToolUse" not in settings["hooks"]
+    assert "Stop" in settings["hooks"]
+    assert "poor_claude.hooks.stop_hook" in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+
+def test_build_settings_embeds_extra_pretool_allow_rules_in_hook_command() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        extra_pretool_allow_rules=["Bash(ls *)", "Read"],
+    )
+    cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--allow" in cmd
+    assert "Bash(ls *)" in cmd
+    assert "Read" in cmd
+
+
+def test_build_settings_embeds_extra_pretool_disallow_rules_in_hook_command() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        extra_pretool_disallow_rules=["Bash(rm *)"],
+    )
+    cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--disallow" in cmd
+    assert "Bash(rm *)" in cmd
+
+
+def test_build_settings_no_allow_flags_when_extra_rules_empty() -> None:
+    settings = build_settings("http://127.0.0.1:1234/hook/stop", extra_pretool_allow_rules=None)
+    cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--allow" not in cmd
+    assert "--disallow" not in cmd
+
+
+def test_build_settings_embeds_policy_file_in_hook_command() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        policy_file=Path("/tmp/route-x/tools-policy.json"),
+    )
+    cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--policy-file" in cmd
+    assert "tools-policy.json" in cmd
+
+
+def test_build_settings_no_policy_file_flag_when_not_set() -> None:
+    settings = build_settings("http://127.0.0.1:1234/hook/stop")
+    cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--policy-file" not in cmd
 
 
 def test_write_settings_writes_local_file(tmp_path) -> None:
@@ -49,8 +110,11 @@ def test_merge_settings_preserves_existing_hooks_and_adds_stop_hook() -> None:
         "permissions": {"allow": ["Bash(ls *)"]},
     }
     merged = merge_settings(base, build_settings("http://127.0.0.1:1234/hook/stop"))
-    assert merged["permissions"] == base["permissions"]
-    assert merged["hooks"]["PreToolUse"] == base["hooks"]["PreToolUse"]
+    assert merged["permissions"]["allow"] == base["permissions"]["allow"]
+    assert "deny" not in merged["permissions"]
+    assert merged["hooks"]["PreToolUse"][0] == base["hooks"]["PreToolUse"][0]
+    assert merged["hooks"]["PreToolUse"][1]["hooks"][0]["type"] == "command"
+    assert "poor_claude.hooks.pretool_hook" in merged["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
     assert len(merged["hooks"]["Stop"]) == 2
     assert "poor_claude.hooks.stop_hook" in merged["hooks"]["Stop"][1]["hooks"][0]["command"]
 
@@ -75,4 +139,76 @@ def test_write_merged_settings_writes_unique_local_file(tmp_path) -> None:
     )
     assert generated.path.name.startswith("claude-settings.merged.")
     assert "PreToolUse" in generated.data["hooks"]
+    assert generated.data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "broker"
+    assert generated.data["hooks"]["PreToolUse"][1]["hooks"][0]["type"] == "command"
+    assert "PreToolUse" in generated.data["hooks"]
     assert "Stop" in generated.data["hooks"]
+
+
+def test_merge_settings_appends_deny_rule_without_overwriting_allow() -> None:
+    base = {
+        "permissions": {
+            "allow": ["Bash(ls *)"],
+            "deny": ["Edit(secret/**)"],
+        }
+    }
+    merged = merge_settings(base, build_settings("http://127.0.0.1:1234/hook/stop"))
+    assert merged["permissions"]["allow"] == ["Bash(ls *)"]
+    assert merged["permissions"]["deny"] == ["Edit(secret/**)"]
+
+
+def test_write_project_local_settings_preserves_existing_local_fields(tmp_path) -> None:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    existing_path = claude_dir / "settings.local.json"
+    existing_path.write_text(json.dumps({"enabledMcpjsonServers": ["poor-claude"]}), encoding="utf-8")
+    generated = write_project_local_settings(
+        project_dir=tmp_path,
+        state_dir=tmp_path / ".poor-claude-state",
+        callback_url="http://127.0.0.1:1234/hook/stop",
+    )
+    assert generated.path == existing_path
+    assert generated.data["enabledMcpjsonServers"] == ["poor-claude"]
+    assert "poor_claude.hooks.pretool_hook" in generated.data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def test_write_project_local_settings_replaces_previous_poor_claude_hooks(tmp_path) -> None:
+    first = write_project_local_settings(
+        project_dir=tmp_path,
+        state_dir=tmp_path / ".poor-claude-state",
+        callback_url="http://127.0.0.1:1111/hook/stop",
+    )
+    second = write_project_local_settings(
+        project_dir=tmp_path,
+        state_dir=tmp_path / ".poor-claude-state",
+        callback_url="http://127.0.0.1:2222/hook/stop",
+    )
+    assert first.path == second.path
+    hooks = second.data["hooks"]
+    assert len(hooks["PreToolUse"]) == 1
+    assert len(hooks["Stop"]) == 1
+    assert "http://127.0.0.1:2222/hook/stop" in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_cleanup_project_local_settings_removes_only_poor_claude_entries(tmp_path) -> None:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    settings_path = claude_dir / "settings.local.json"
+    generated = write_project_local_settings(
+        project_dir=tmp_path,
+        state_dir=tmp_path / ".poor-claude-state",
+        callback_url="http://127.0.0.1:1234/hook/stop",
+    )
+    merged = generated.data
+    merged["enabledMcpjsonServers"] = ["poor-claude"]
+    settings_path.write_text(json.dumps(merged), encoding="utf-8")
+    cleanup_project_local_settings(tmp_path)
+    cleaned = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert cleaned == {"enabledMcpjsonServers": ["poor-claude"]}
+
+
+def test_strip_poor_claude_managed_settings_removes_managed_rules() -> None:
+    stripped = strip_poor_claude_managed_settings(
+        build_settings("http://127.0.0.1:1234/hook/stop", permission_log_path=Path("/tmp/permission.log"))
+    )
+    assert stripped == {}

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 
 from poor_claude.compat import stream_json_lines
 from poor_claude.config import resolve_ttl
@@ -14,17 +15,38 @@ from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.prompt import PromptError, resolve_prompt
 
 
+RESUME_PICKER_SENTINEL = "__poor_claude_resume_picker__"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-no-p")
     parser.add_argument("prompt", nargs="?")
-    parser.add_argument("-p", "--print", dest="print_mode", action="store_true")
+    parser.add_argument("-p", "--print", dest="print_prompt", nargs="?", const=True)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--session-id")
-    parser.add_argument("--resume")
+    parser.add_argument("-r", "--resume", nargs="?", const=RESUME_PICKER_SENTINEL)
     parser.add_argument("--output-format", choices=["text", "json", "stream-json"], default="text")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--settings")
+    parser.add_argument(
+        "--permission-mode",
+        choices=["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"],
+        default="default",
+    )
+    # Legacy alias: --dangerously-skip-permissions maps to --permission-mode bypassPermissions
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--effort", default="medium")
+    parser.add_argument("--model")
+    parser.add_argument("--add-dir", action="append", dest="add_dirs", metavar="DIR",
+                        help="Additional directory to allow tool access to; may be repeated")
+    parser.add_argument("--tools", action="append", dest="tools", metavar="TOOL",
+                        help="Restrict built-in tool set (e.g. 'Bash' 'Edit'); use '' to disable all; may be repeated")
+    parser.add_argument("--system-prompt")
+    parser.add_argument("--append-system-prompt")
+    parser.add_argument("--allowed-tools", action="append", dest="allowed_tools", metavar="RULE",
+                        help="Allow a tool rule (e.g. 'Bash(ls *)'); may be repeated")
+    parser.add_argument("--disallowed-tools", action="append", dest="disallowed_tools", metavar="RULE",
+                        help="Deny a tool rule (takes priority over --allowed-tools); may be repeated")
     parser.add_argument("--workdir", default=os.getcwd())
     parser.add_argument("--ttl")
     parser.add_argument("--keep-alive", action="store_true")
@@ -33,18 +55,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-session", action="store_true")
     parser.add_argument("--shutdown", action="store_true")
     parser.add_argument("--sessions", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--prune-sessions", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--launch-process", action="store_true")
-    parser.add_argument("--auto-accept-workspace-trust", action="store_true")
+    parser.set_defaults(auto_accept_startup_prompts=True)
+    parser.add_argument("--auto-accept-startup-prompts", dest="auto_accept_startup_prompts", action="store_true")
+    parser.add_argument("--no-auto-accept-startup-prompts", dest="auto_accept_startup_prompts", action="store_false")
+    parser.add_argument(
+        "--auto-accept-workspace-trust",
+        dest="auto_accept_startup_prompts",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if args.resume == RESUME_PICKER_SENTINEL:
+        parser.error("bare -r/--resume picker is not supported; pass --resume <session-id>")
     if args.session_id and args.resume:
         parser.error("--session-id and --resume cannot be used together")
     target_session_id = args.session_id or args.resume
+    if target_session_id is not None:
+        try:
+            target_session_id = str(uuid.UUID(target_session_id))
+        except ValueError:
+            if _uses_short_resume(raw_argv) and args.prompt is None:
+                parser.error("-r with a non-UUID value is ambiguous; use --resume <session-id> for named sessions")
+            pass
+        if args.session_id:
+            args.session_id = target_session_id
+        else:
+            args.resume = target_session_id
 
     try:
         ttl = resolve_ttl(
@@ -55,13 +101,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions]
+    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions, args.prune_sessions]
     needs_prompt = not any(control_commands)
     resolved = None
     if needs_prompt or args.dry_run:
         try:
             resolved = resolve_prompt(
-                print_prompt=None,
+                print_prompt=args.print_prompt,
                 positional_prompt=args.prompt,
                 stdin=sys.stdin,
             )
@@ -74,9 +120,10 @@ def main(argv: list[str] | None = None) -> int:
             "resume": args.resume,
             "prompt": resolved.prompt if resolved else None,
             "prompt_source": resolved.source if resolved else None,
-            "print_mode": args.print_mode,
+            "print_mode": args.print_prompt is not None,
             "output_format": args.output_format,
             "settings": args.settings,
+            "auto_accept_startup_prompts": args.auto_accept_startup_prompts,
             "timeout_seconds": args.timeout,
             "ttl_seconds": ttl.ttl_seconds,
             "keep_alive": ttl.keep_alive,
@@ -98,7 +145,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.sessions:
             result = request_json("GET", f"{state.address}/sessions")
-            print(json.dumps(result, indent=2, sort_keys=True))
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(_format_sessions(result.get("sessions", [])))
+            return 0
+
+        if args.prune_sessions:
+            result = request_json("POST", f"{state.address}/prune", {})
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                removed = result.get("removed_routes", [])
+                count = len(removed) if isinstance(removed, list) else 0
+                print(f"Pruned {count} session(s).")
             return 0
 
         if args.stop_session:
@@ -122,12 +182,23 @@ def main(argv: list[str] | None = None) -> int:
                     "keep_alive": ttl.keep_alive,
                     "workdir": args.workdir,
                     "settings_path": args.settings,
-                    "dangerously_skip_permissions": args.dangerously_skip_permissions,
+                    "resume_session": bool(args.resume),
+                    "permission_mode": "bypassPermissions" if args.dangerously_skip_permissions else args.permission_mode,
                     "dangerously_load_development_channels": True,
                     "launch_process": args.launch_process,
-                    "auto_accept_workspace_trust": args.auto_accept_workspace_trust,
+                    "auto_accept_workspace_trust": args.auto_accept_startup_prompts,
+                    "effort": args.effort,
+                    "model": args.model,
+                    "add_dirs": args.add_dirs,
+                    "tools": args.tools,
+                    "system_prompt": args.system_prompt,
+                    "append_system_prompt": args.append_system_prompt,
+                    "allowed_tools": args.allowed_tools or [],
+                    "disallowed_tools": args.disallowed_tools or [],
                 },
             )
+            for warning in result.get("warnings") or []:
+                print(f"WARNING: {warning}", file=sys.stderr)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
@@ -137,21 +208,31 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "session_id": target_session_id,
                 "settings_path": args.settings,
-                "dangerously_skip_permissions": args.dangerously_skip_permissions,
+                "resume_session": bool(args.resume),
+                "permission_mode": "bypassPermissions" if args.dangerously_skip_permissions else args.permission_mode,
                 "dangerously_load_development_channels": True,
                 "launch_process": True,
-                "auto_accept_workspace_trust": args.auto_accept_workspace_trust,
+                "auto_accept_workspace_trust": args.auto_accept_startup_prompts,
                 "wait_for_response": True,
                 "prompt": resolved.prompt if resolved else "",
                 "timeout_seconds": args.timeout,
                 "ttl_seconds": ttl.ttl_seconds,
                 "keep_alive": ttl.keep_alive,
                 "workdir": args.workdir,
+                "effort": args.effort,
+                "model": args.model,
+                "tools": args.tools,
+                "system_prompt": args.system_prompt,
+                "append_system_prompt": args.append_system_prompt,
+                "allowed_tools": args.allowed_tools or [],
+                "disallowed_tools": args.disallowed_tools or [],
             },
             timeout=args.timeout + 5,
         )
         if args.debug:
             print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        for warning in result.get("warnings") or []:
+            print(f"WARNING: {warning}", file=sys.stderr)
         session_id = str(result["session_id"])
         response_text = str(result.get("response", ""))
         if args.output_format == "stream-json":
@@ -165,7 +246,73 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (TimeoutError, HttpClientError, OSError) as exc:
         print(f"claude-no-p failed: {exc}", file=sys.stderr)
+        if isinstance(exc, HttpClientError) and isinstance(exc.payload, dict):
+            diagnostics = exc.payload.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                print(_format_diagnostics(diagnostics), file=sys.stderr)
         return 1
+
+
+def _uses_short_resume(argv: list[str]) -> bool:
+    return any(token == "-r" or (token.startswith("-r") and token != "-") for token in argv)
+
+
+def _format_diagnostics(diagnostics: dict) -> str:
+    lines = ["Diagnostics:"]
+    for key in ("session_id", "route_key", "process_alive", "process_pid"):
+        value = diagnostics.get(key)
+        if value is not None:
+            lines.append(f"  {key}: {value}")
+    paths = diagnostics.get("paths")
+    if isinstance(paths, dict) and paths:
+        lines.append("  paths:")
+        for key, value in paths.items():
+            lines.append(f"    {key}: {value}")
+    summaries = diagnostics.get("summaries")
+    if isinstance(summaries, dict) and summaries:
+        lines.append("  summaries:")
+        for key, value in summaries.items():
+            if value:
+                lines.append(f"    {key}: {value}")
+    return "\n".join(lines)
+
+
+def _format_sessions(sessions: object) -> str:
+    if not isinstance(sessions, list) or not sessions:
+        return "No active sessions."
+    rows = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+        active = session.get("active_request")
+        process_alive = metadata.get("process_alive")
+        if active:
+            status = "active"
+        elif metadata.get("process_stopping") == "True":
+            status = "stopping"
+        elif process_alive == "True":
+            status = "idle"
+        elif process_alive == "False":
+            status = "stopped"
+        else:
+            status = "ready"
+        rows.append(
+            {
+                "SESSION": str(session.get("session_id", "")),
+                "STATUS": status,
+                "RESUME": "yes" if metadata.get("resume_on_launch") == "True" else "no",
+                "TTL": "keep" if session.get("keep_alive") else str(session.get("ttl_seconds", "")),
+                "WORKDIR": str(session.get("workdir", "")),
+            }
+        )
+    headers = ["SESSION", "STATUS", "RESUME", "TTL", "WORKDIR"]
+    widths = {header: max(len(header), *(len(row[header]) for row in rows)) for header in headers}
+    lines = ["  ".join(header.ljust(widths[header]) for header in headers)]
+    lines.append("  ".join("-" * widths[header] for header in headers))
+    for row in rows:
+        lines.append("  ".join(row[header].ljust(widths[header]) for header in headers))
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":  # pragma: no cover

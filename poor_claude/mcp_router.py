@@ -35,7 +35,13 @@ class ChannelNotification:
 
 
 def wrap_prompt(*, request_id: str, prompt: str) -> str:
-    return f'<poor-claude-request id="{request_id}">\n{prompt}\n</poor-claude-request>'
+    return (
+        f'<poor-claude-request id="{request_id}">\n'
+        "Answer the USER PROMPT directly. The XML tags are transport metadata; "
+        "do not search for poor-claude tools or callbacks.\n\n"
+        f"USER PROMPT:\n{prompt}\n"
+        "</poor-claude-request>"
+    )
 
 
 class SessionChannelQueue:
@@ -57,6 +63,13 @@ class SessionChannelQueue:
     def empty(self) -> bool:
         return self._queue.empty()
 
+    def clear(self) -> None:
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
 
 class McpRouter:
     def __init__(self) -> None:
@@ -74,6 +87,11 @@ class McpRouter:
 
     def remove_route(self, route_key: str) -> None:
         self._queues.pop(route_key, None)
+
+    def clear_route(self, route_key: str) -> None:
+        queue = self._queues.get(route_key)
+        if queue is not None:
+            queue.clear()
 
     def remove_session(self, session_id: str) -> None:
         self.remove_route(session_id)

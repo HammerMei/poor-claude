@@ -16,6 +16,14 @@ def test_wrap_prompt_includes_request_id() -> None:
     assert "hello" in wrapped
 
 
+def test_wrap_prompt_keeps_transport_instruction_short_and_direct() -> None:
+    wrapped = wrap_prompt(request_id="req1", prompt="hello")
+    assert "Answer the USER PROMPT directly" in wrapped
+    assert "do not search for poor-claude tools or callbacks" in wrapped
+    assert "USER PROMPT:\nhello" in wrapped
+    assert len(wrapped) < 240
+
+
 def test_router_keeps_session_queues_isolated() -> None:
     async def run() -> None:
         router = McpRouter()
@@ -73,5 +81,18 @@ def test_queue_rejects_wrong_session() -> None:
         queue_b = router.ensure_route("/tmp/b::b")
         with pytest.raises(ValueError, match="does not match"):
             await queue_b.put(notification)
+
+    asyncio.run(run())
+
+
+def test_router_can_clear_route_queue() -> None:
+    async def run() -> None:
+        router = McpRouter()
+        await router.route_prompt(route_key="route", session_id="demo", request_id="req1", prompt="hello")
+        queue = router.queue_for("route")
+        assert queue is not None
+        assert not queue.empty()
+        router.clear_route("route")
+        assert queue.empty()
 
     asyncio.run(run())

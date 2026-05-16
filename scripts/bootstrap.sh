@@ -11,7 +11,7 @@
 # Options:
 #   --bin-dir DIR    Install wrapper to DIR (default: ~/.local/bin)
 #   --name NAME      Wrapper executable name (default: claude-no-p)
-#   --ref REF        Git ref to install (branch, tag, SHA; default: main)
+#   --ref REF        Git ref to install (tag, branch, SHA; default: latest release tag)
 #   --upgrade        Re-install/upgrade an existing installation
 #   -h, --help       Show this help
 
@@ -21,7 +21,7 @@ INSTALL_DIR="${HOME}/.poor-claude"
 VENV_DIR="${INSTALL_DIR}/venv"
 BIN_DIR="${HOME}/.local/bin"
 NAME="claude-no-p"
-REF="main"
+REF=""
 UPGRADE=0
 REPO="HammerMei/poor-claude"
 
@@ -72,6 +72,19 @@ if [[ -d "${VENV_DIR}" && "${UPGRADE}" -eq 0 ]]; then
   printf '  Venv:    %s\n' "${VENV_DIR}"
   printf '  Wrapper: %s/%s\n' "${BIN_DIR}" "${NAME}"
   exit 0
+fi
+
+# --- Resolve ref --------------------------------------------------------------
+
+if [[ -z "${REF}" ]]; then
+  printf 'Fetching latest release tag...\n'
+  REF=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || true)
+  if [[ -z "${REF}" ]]; then
+    printf 'warning: could not fetch latest release, falling back to main\n' >&2
+    REF="main"
+  fi
+  printf '  Using ref: %s\n' "${REF}"
 fi
 
 # --- Install ------------------------------------------------------------------

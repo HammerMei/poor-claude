@@ -78,19 +78,19 @@ export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 
 ```bash
 # One-shot prompt (like claude -p)
-claude-no-p "what is 2+2"
+claude-no-p -p "what is 2+2"
 
 # Resume a named session
-claude-no-p --session-id my-bot "follow-up question"
+claude-no-p --resume my-bot -p "follow-up question"
 
 # With a specific model and effort level
-claude-no-p --model claude-opus-4-5 --effort high "write me a haiku"
+claude-no-p --model claude-opus-4-5 --effort high -p "write me a haiku"
 
 # Pipe input
 echo "summarise this" | claude-no-p -p
 
 # JSON output
-claude-no-p --output-format json "hello"
+claude-no-p --output-format json -p "hello"
 ```
 
 ## Session lifecycle

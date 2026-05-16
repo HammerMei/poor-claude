@@ -81,7 +81,7 @@ export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 claude-no-p -p "what is 2+2"
 
 # Resume a named session
-claude-no-p --resume my-bot -p "follow-up question"
+claude-no-p --resume 4b3e8f21-7a2d-4c9e-b1f6-3d0a5c2e9b87 -p "follow-up question"
 
 # With a specific model and effort level
 claude-no-p --model claude-opus-4-5 --effort high -p "write me a haiku"

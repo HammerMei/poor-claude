@@ -9,6 +9,8 @@ A drop-in replacement for `claude -p` (headless mode) that routes prompts throug
 per call — keeping your usage under a Claude subscription rather than billing as API
 calls.
 
+> If this saved your wallet, a ⭐ [star](https://github.com/HammerMei/poor-claude) is free — unlike `claude -p`.
+
 ## Why
 
 Starting June 2025, `claude -p` is billed as API usage separate from the subscription.

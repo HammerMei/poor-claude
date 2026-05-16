@@ -46,10 +46,7 @@ claude-no-p "your prompt"
 ## Installation
 
 ```bash
-# Clone the repo, then run the install script:
-git clone https://github.com/your-org/poor-claude.git
-cd poor-claude
-scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/HammerMei/poor-claude/main/scripts/bootstrap.sh | bash
 ```
 
 This installs the package into `~/.poor-claude/venv/` and creates a
@@ -57,10 +54,18 @@ This installs the package into `~/.poor-claude/venv/` and creates a
 
 ```bash
 # Custom install location
-scripts/install.sh --bin-dir /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/HammerMei/poor-claude/main/scripts/bootstrap.sh | bash -s -- --bin-dir /usr/local/bin
 
 # Update an existing install
-scripts/install.sh --upgrade
+curl -fsSL https://raw.githubusercontent.com/HammerMei/poor-claude/main/scripts/bootstrap.sh | bash -s -- --upgrade
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/HammerMei/poor-claude.git
+cd poor-claude
+scripts/install.sh
 ```
 
 Make sure `~/.local/bin` is on your `PATH`:

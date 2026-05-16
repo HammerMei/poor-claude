@@ -1,5 +1,9 @@
 # poor-claude (`claude-no-p`)
 
+<p align="center">
+  <img src="docs/mascot.png" alt="poor-claude mascot" width="360">
+</p>
+
 A drop-in replacement for `claude -p` (headless mode) that routes prompts through
 **persistent interactive Claude Code sessions** instead of spawning a new subprocess
 per call — keeping your usage under a Claude subscription rather than billing as API

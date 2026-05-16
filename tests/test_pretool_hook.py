@@ -88,7 +88,7 @@ def test_tool_is_allowed_real_global_settings_rules() -> None:
     ]
     assert _tool_is_allowed(
         "Bash",
-        {"command": "python3 /Users/glin/.claude/skills/tts.py hi"},
+        {"command": "python3 /home/user/.claude/skills/tts.py hi"},
         rules,
     )
     assert _tool_is_allowed("Bash", {"command": "tts-cli.py --voice Yue hello"}, rules)

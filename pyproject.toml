@@ -5,8 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "poor-claude"
 version = "0.1.0"
-description = "POC for routing claude-no-p prompts through persistent Claude Code sessions."
+description = "Drop-in replacement for `claude -p` that routes prompts through persistent interactive Claude Code sessions, keeping usage under your subscription."
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["claude", "claude-code", "anthropic", "ai", "cli"]
 
 [project.scripts]
 claude-no-p = "poor_claude.cli:main"

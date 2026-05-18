@@ -10,6 +10,7 @@ import signal
 import threading
 import time
 import uuid
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -799,9 +800,25 @@ def make_handler(state: ControlState):
     return Handler
 
 
+class _FastBindHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that skips the reverse-DNS lookup in server_bind.
+
+    The stock HTTPServer.server_bind calls socket.getfqdn() to populate
+    self.server_name.  On macOS this reverse-DNS lookup for 127.0.0.1 can
+    block for 30+ seconds when the process is spawned in a new session (no
+    shared DNS cache).  Since we only ever bind to loopback and never use
+    server_name, we skip the lookup and hard-code "localhost".
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
 def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     state = ControlState(state_dir=state_file.parent)
-    server = ThreadingHTTPServer((host, port), make_handler(state))
+    server = _FastBindHTTPServer((host, port), make_handler(state))
     server.daemon_threads = False
     server.timeout = 0.5
     address = f"http://{server.server_address[0]}:{server.server_address[1]}"

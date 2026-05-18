@@ -321,7 +321,8 @@ def test_startup_acceptance_accepts_bypass_permissions_second_option() -> None:
     keys, name = _startup_acceptance_keys(
         "WARNING: Claude Code running in Bypass Permissions mode 1. No, exit 2. Yes, I accept Enter to confirm"
     )
-    assert keys == b"\x1b[B\r"
+    # App Cursor Keys mode Down (\\x1bOB) to move from option-1 to option-2, then Enter.
+    assert keys == [b"\x1bOB", b"\r"]
     assert name == "bypass-permissions"
 
 
@@ -332,9 +333,11 @@ def test_startup_acceptance_accepts_mcp_and_dev_channel_defaults() -> None:
     dev_keys, dev_name = _startup_acceptance_keys(
         "WARNING: Loading development channels 1. I am using this for local development 2. Exit Enter to confirm"
     )
-    assert mcp_keys == b"\x1b[B\r"
+    # App Cursor Keys mode Down to select option-2 ("use once"), then Enter.
+    assert mcp_keys == [b"\x1bOB", b"\r"]
     assert mcp_name == "mcp-server"
-    assert dev_keys == b"\r"
+    # development-channels: option-1 is default, just confirm with Enter.
+    assert dev_keys == [b"\r"]
     assert dev_name == "development-channels"
 
 
@@ -366,8 +369,10 @@ def test_drain_pty_to_log_auto_accepts_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
     monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
     monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
     launcher._drain_pty_to_log(9, log_path, auto_accept_startup_prompts=True)
-    assert writes == [(9, b"\x1b[B\r")]
+    # App Cursor Keys Down sent first, then Enter after 50 ms pause (patched to no-op).
+    assert writes == [(9, b"\x1bOB"), (9, b"\r")]
     assert "auto-accept startup prompt: bypass-permissions" in log_path.read_text(encoding="utf-8")
 
 

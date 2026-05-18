@@ -303,18 +303,33 @@ def _drain_pty_to_log(master_fd: int, log_path: Path | None, auto_accept_startup
                 if time.monotonic() > startup_deadline or "listening for channel messages" in plain_recent:
                     auto_accept_startup_prompts = False
                     continue
-                keys, prompt_name = _startup_acceptance_keys(recent, accepted)
-                if keys is not None and prompt_name is not None:
+                key_chunks, prompt_name = _startup_acceptance_keys(recent, accepted)
+                if key_chunks is not None and prompt_name is not None:
                     try:
                         handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
                         handle.flush()
-                        os.write(master_fd, keys)
+                        for i, key_chunk in enumerate(key_chunks):
+                            if i > 0:
+                                time.sleep(0.05)
+                            os.write(master_fd, key_chunk)
                         accepted.add(prompt_name)
                     except OSError:
                         return
 
 
-def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) -> tuple[bytes | None, str | None]:
+def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) -> tuple[list[bytes] | None, str | None]:
+    """Return key chunks to send (with 50 ms between each) to accept a startup prompt.
+
+    Claude Code's interactive selection widgets run inside Ink (React for CLIs), which
+    enables Application Cursor Keys mode (\\x1b[?1h) before rendering.  In that mode the
+    terminal expects \\x1bOB for Down-arrow instead of the normal-mode \\x1b[B.  Sending
+    the wrong sequence causes the keystroke to be ignored and Enter then confirms the
+    default selection — which is "No, exit" for bypass-permissions.
+
+    We also split the navigation key from the Enter confirmation so each chunk is written
+    separately with a 50 ms pause, giving the Ink widget time to process the navigation
+    before we confirm.
+    """
     accepted = accepted or set()
     text = _plain_terminal_text(raw_text)
     if (
@@ -327,7 +342,8 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
         and "enter to confirm" in text
     ):
         if "bypass-permissions" not in accepted:
-            return b"\x1b[B\r", "bypass-permissions"
+            # App-mode Down (\\x1bOB) to move from option-1 to option-2, then Enter.
+            return [b"\x1bOB", b"\r"], "bypass-permissions"
     if (
         "new mcp server found" in text
         and "poor-claude" in text
@@ -337,7 +353,8 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
         and "enter to confirm" in text
     ):
         if "mcp-server" not in accepted:
-            return b"\x1b[B\r", "mcp-server"
+            # App-mode Down to select option-2 ("use this server once"), then Enter.
+            return [b"\x1bOB", b"\r"], "mcp-server"
     if (
         "warning" in text
         and "loading development channels" in text
@@ -346,7 +363,8 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
         and "enter to confirm" in text
     ):
         if "development-channels" not in accepted:
-            return b"\r", "development-channels"
+            # Option-1 is already highlighted by default; just confirm with Enter.
+            return [b"\r"], "development-channels"
     return None, None
 
 

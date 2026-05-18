@@ -5,6 +5,7 @@ from pathlib import Path
 from poor_claude.settings import (
     build_settings,
     cleanup_project_local_settings,
+    ensure_skip_dangerous_mode_prompt,
     merge_settings,
     read_settings,
     strip_poor_claude_managed_settings,
@@ -212,3 +213,29 @@ def test_strip_poor_claude_managed_settings_removes_managed_rules() -> None:
         build_settings("http://127.0.0.1:1234/hook/stop", permission_log_path=Path("/tmp/permission.log"))
     )
     assert stripped == {}
+
+
+def test_ensure_skip_dangerous_mode_prompt_creates_settings_file_when_missing(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    ensure_skip_dangerous_mode_prompt(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["skipDangerousModePermissionPrompt"] is True
+
+
+def test_ensure_skip_dangerous_mode_prompt_adds_key_to_existing_settings(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"someOtherKey": "preserved"}), encoding="utf-8")
+    ensure_skip_dangerous_mode_prompt(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["skipDangerousModePermissionPrompt"] is True
+    assert data["someOtherKey"] == "preserved"
+
+
+def test_ensure_skip_dangerous_mode_prompt_is_noop_when_already_set(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    original = {"skipDangerousModePermissionPrompt": True, "otherKey": "value"}
+    path.write_text(json.dumps(original), encoding="utf-8")
+    mtime_before = path.stat().st_mtime_ns
+    ensure_skip_dangerous_mode_prompt(path)
+    assert path.stat().st_mtime_ns == mtime_before, "file should not be rewritten when key already set"
+    assert json.loads(path.read_text(encoding="utf-8")) == original

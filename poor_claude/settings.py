@@ -283,6 +283,34 @@ def write_project_local_settings(
     return GeneratedSettings(path=path, data=data)
 
 
+def ensure_skip_dangerous_mode_prompt(global_settings_path: Path | None = None) -> None:
+    """Write skipDangerousModePermissionPrompt=true to ~/.claude/settings.json.
+
+    Claude Code shows an interactive confirmation prompt whenever it is started
+    with bypass-permissions flags (--dangerously-skip-permissions or
+    --permission-mode bypassPermissions).  On a fresh machine the prompt blocks
+    every process start until a human accepts it.
+
+    Writing this key to the global user settings is equivalent to having
+    accepted the prompt once interactively — exactly what Claude Code itself
+    does after the user clicks "Yes, I accept".  Callers that set
+    auto_accept_workspace_trust=True have already opted in to unattended bypass
+    mode, so pre-writing the key is the correct and reliable approach (vs.
+    injecting key sequences into the PTY, which is fragile).
+    """
+    path = global_settings_path or Path.home() / ".claude" / "settings.json"
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    if data.get("skipDangerousModePermissionPrompt") is True:
+        return  # already set, nothing to do
+    data["skipDangerousModePermissionPrompt"] = True
+    _write_json_atomic(path, data)
+
+
 def cleanup_project_local_settings(project_dir: Path) -> None:
     path = project_dir / ".claude" / "settings.local.json"
     if not path.exists():

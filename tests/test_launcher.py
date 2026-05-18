@@ -317,13 +317,13 @@ def test_launch_claude_non_pty_uses_file_handles(tmp_path, monkeypatch) -> None:
     assert captured["kwargs"]["stderr"].name.endswith("err.log")
 
 
-def test_startup_acceptance_accepts_bypass_permissions_second_option() -> None:
+def test_startup_acceptance_ignores_bypass_permissions_prompt() -> None:
+    """bypass-permissions is handled via ensure_skip_dangerous_mode_prompt(), not key sequences."""
     keys, name = _startup_acceptance_keys(
         "WARNING: Claude Code running in Bypass Permissions mode 1. No, exit 2. Yes, I accept Enter to confirm"
     )
-    # App Cursor Keys mode Down (\\x1bOB) to move from option-1 to option-2, then Enter.
-    assert keys == [b"\x1bOB", b"\r"]
-    assert name == "bypass-permissions"
+    assert keys is None
+    assert name is None
 
 
 def test_startup_acceptance_accepts_mcp_and_dev_channel_defaults() -> None:
@@ -356,7 +356,28 @@ def test_plain_terminal_text_strips_ansi_sequences() -> None:
     assert text == "warning: loading development channels"
 
 
-def test_drain_pty_to_log_auto_accepts_once(tmp_path, monkeypatch) -> None:
+def test_drain_pty_to_log_auto_accepts_dev_channels_prompt(tmp_path, monkeypatch) -> None:
+    """development-channels prompt (option-1 default) is accepted with a single Enter."""
+    log_path = tmp_path / "pty.log"
+    writes = []
+    chunks = iter(
+        [
+            b"WARNING: Loading development channels 1. I am using this for local development 2. Exit Enter to confirm",
+            b"",
+        ]
+    )
+
+    monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
+    monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    launcher._drain_pty_to_log(9, log_path, auto_accept_startup_prompts=True)
+    assert writes == [(9, b"\r")]
+    assert "auto-accept startup prompt: development-channels" in log_path.read_text(encoding="utf-8")
+
+
+def test_drain_pty_to_log_bypass_permissions_prompt_not_handled_via_keys(tmp_path, monkeypatch) -> None:
+    """bypass-permissions is suppressed via settings, not key injection — no writes expected."""
     log_path = tmp_path / "pty.log"
     writes = []
     chunks = iter(
@@ -369,11 +390,35 @@ def test_drain_pty_to_log_auto_accepts_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
     monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
     monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
     launcher._drain_pty_to_log(9, log_path, auto_accept_startup_prompts=True)
-    # App Cursor Keys Down sent first, then Enter after 50 ms pause (patched to no-op).
-    assert writes == [(9, b"\x1bOB"), (9, b"\r")]
-    assert "auto-accept startup prompt: bypass-permissions" in log_path.read_text(encoding="utf-8")
+    assert writes == []
+
+
+def test_prepare_launch_spec_calls_ensure_skip_prompt_when_auto_accept_enabled(tmp_path, monkeypatch) -> None:
+    """When auto_accept_workspace_trust=True, prepare_launch_spec pre-writes the settings key."""
+    called = []
+    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: called.append(True))
+
+    registry = SessionRegistry()
+    session = registry.create_or_get(
+        session_id="demo", ttl_seconds=3600, keep_alive=False, workdir=str(tmp_path)
+    )
+    session.metadata["auto_accept_workspace_trust"] = "True"
+    prepare_launch_spec(session=session, state_dir=tmp_path, callback_base_url="http://127.0.0.1:1234")
+    assert called == [True]
+
+
+def test_prepare_launch_spec_does_not_call_ensure_skip_prompt_when_auto_accept_disabled(tmp_path, monkeypatch) -> None:
+    """Without auto_accept_workspace_trust the settings key must not be touched."""
+    called = []
+    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: called.append(True))
+
+    registry = SessionRegistry()
+    session = registry.create_or_get(
+        session_id="demo", ttl_seconds=3600, keep_alive=False, workdir=str(tmp_path)
+    )
+    prepare_launch_spec(session=session, state_dir=tmp_path, callback_base_url="http://127.0.0.1:1234")
+    assert called == []
 
 
 def test_prepare_launch_spec_writes_policy_file_and_embeds_path_in_hook(tmp_path) -> None:

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from poor_claude.mcp_router import CHANNEL_NAME
 from poor_claude.mcp_validation import build_mcp_config
-from poor_claude.settings import cleanup_project_local_settings, write_merged_settings
+from poor_claude.settings import cleanup_project_local_settings, ensure_skip_dangerous_mode_prompt, write_merged_settings
 from poor_claude.session import SessionRecord
 
 
@@ -172,6 +172,14 @@ def prepare_launch_spec(
     # in the payload, so we inject it and let the hook's mode check handle it.)
     permission_mode = session.metadata.get("permission_mode") or "default"
     include_pretool_hook = permission_mode != "bypassPermissions"
+    auto_accept = session.metadata.get("auto_accept_workspace_trust") == "True"
+    if auto_accept:
+        # Pre-write skipDangerousModePermissionPrompt=true to ~/.claude/settings.json
+        # so Claude Code never shows the interactive bypass-permissions confirmation
+        # prompt on this machine.  This is exactly what Claude Code writes after a
+        # human clicks "Yes, I accept" — we just do it upfront since the operator
+        # opted in by setting auto_accept_workspace_trust=True.
+        ensure_skip_dangerous_mode_prompt()
     # Write allow/disallow rules to a fixed path baked into the hook command once at
     # launch. The file is rewritten on every request so rule changes take effect
     # immediately — the hook reads it fresh on each invocation, no restart needed.
@@ -324,26 +332,21 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
     enables Application Cursor Keys mode (\\x1b[?1h) before rendering.  In that mode the
     terminal expects \\x1bOB for Down-arrow instead of the normal-mode \\x1b[B.  Sending
     the wrong sequence causes the keystroke to be ignored and Enter then confirms the
-    default selection — which is "No, exit" for bypass-permissions.
+    default selection — so prompts requiring navigation to a non-default option must use
+    \\x1bOB, not \\x1b[B.
 
     We also split the navigation key from the Enter confirmation so each chunk is written
     separately with a 50 ms pause, giving the Ink widget time to process the navigation
     before we confirm.
+
+    Note: the bypass-permissions warning prompt is intentionally NOT handled here.
+    Instead, ``ensure_skip_dangerous_mode_prompt()`` writes
+    ``skipDangerousModePermissionPrompt=true`` to ``~/.claude/settings.json`` before
+    Claude starts, which prevents the prompt from appearing at all.  PTY key injection
+    is too fragile for a safety-gate prompt; the settings approach is deterministic.
     """
     accepted = accepted or set()
     text = _plain_terminal_text(raw_text)
-    if (
-        "warning" in text
-        and "bypass permissions" in text
-        and "1. no" in text
-        and "exit" in text
-        and "2. yes" in text
-        and "accept" in text
-        and "enter to confirm" in text
-    ):
-        if "bypass-permissions" not in accepted:
-            # App-mode Down (\\x1bOB) to move from option-1 to option-2, then Enter.
-            return [b"\x1bOB", b"\r"], "bypass-permissions"
     if (
         "new mcp server found" in text
         and "poor-claude" in text

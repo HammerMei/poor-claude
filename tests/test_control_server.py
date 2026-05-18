@@ -1433,3 +1433,360 @@ def test_control_server_can_launch_and_stop_managed_process(tmp_path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Background-agent counter: /hook/agent-started, /hook/subagent-stop,
+# and the gated Stop hook
+# ---------------------------------------------------------------------------
+
+
+def test_stop_hook_defers_when_background_agents_pending(tmp_path) -> None:
+    """Stop hook returns deferred=True and does NOT complete the request while
+    pending_background_agents > 0."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "launch bg agent",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+
+        # Simulate PreToolUse(Agent, bg=True) being allowed
+        agent_started = request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+        assert agent_started["ok"] is True
+        assert agent_started["pending"] == 1
+
+        # First (premature) Stop fires — should be deferred
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "response": "launched",
+                "cwd": str(tmp_path),
+            },
+        )
+        assert stop_response.get("deferred") is True
+
+        # Request is still active
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] == queued["request_id"]
+
+        # Background agent finishes
+        subagent_stop = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+        assert subagent_stop["ok"] is True
+        assert subagent_stop["pending"] == 0
+
+        # Final Stop fires — should complete
+        final_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "response": "Agent output: DONE",
+                "cwd": str(tmp_path),
+            },
+        )
+        assert final_stop == {"ok": True}
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stop_hook_completes_immediately_when_no_background_agents(tmp_path) -> None:
+    """Normal (no bg agents) Stop hook continues to complete the request immediately."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "response": "world",
+                "cwd": str(tmp_path),
+            },
+        )
+        assert stop_response == {"ok": True}
+        assert "deferred" not in stop_response
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_agent_started_increments_counter(tmp_path) -> None:
+    server, address = start_test_server()
+    try:
+        request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        r1 = request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        assert r1["pending"] == 1
+
+        r2 = request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        assert r2["pending"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_subagent_stop_decrements_counter(tmp_path) -> None:
+    server, address = start_test_server()
+    try:
+        request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        r = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        assert r["pending"] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_subagent_stop_clamps_at_zero(tmp_path) -> None:
+    """Extra SubagentStop calls (e.g. from sync agents) don't drive counter negative."""
+    server, address = start_test_server()
+    try:
+        request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        # No agent-started, so counter starts at 0
+        r = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        assert r["pending"] == 0
+
+        # Subsequent Stop should complete normally (counter is 0)
+        session_id = request_json("GET", f"{address}/sessions")["sessions"][0]["session_id"]
+        stop_r = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "ok", "cwd": str(tmp_path)},
+        )
+        assert stop_r == {"ok": True}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_counter_resets_on_new_request(tmp_path) -> None:
+    """pending_background_agents resets to 0 at the start of each new request."""
+    server, address = start_test_server()
+    try:
+        # Start first request, increment counter, complete via SubagentStop + Stop
+        request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "r1",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": "demo", "cwd": str(tmp_path)},
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "response": "r1 done", "cwd": str(tmp_path)},
+        )
+
+        # Start second request — counter must be reset to 0
+        request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "r2",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        # Stop immediately (no bg agents) — must complete without defer
+        stop_r = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "response": "r2 done", "cwd": str(tmp_path)},
+        )
+        assert stop_r == {"ok": True}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_agent_started_returns_no_session_when_session_not_found(tmp_path) -> None:
+    server, address = start_test_server()
+    try:
+        r = request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": "nonexistent-session-id", "cwd": str(tmp_path)},
+        )
+        assert r.get("no_session") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_subagent_stop_returns_no_session_when_session_not_found(tmp_path) -> None:
+    server, address = start_test_server()
+    try:
+        r = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": "nonexistent-session-id", "cwd": str(tmp_path)},
+        )
+        assert r.get("no_session") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_transcript_path_defers_when_background_agents_pending(tmp_path, monkeypatch) -> None:
+    """The _wait_for_response() transcript path does not complete the request when
+    pending_background_agents > 0, even if transcript shows end_turn."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    call_counts = {"n": 0}
+
+    def fake_read_response(*_args, **_kwargs):
+        call_counts["n"] += 1
+        if call_counts["n"] >= 2:
+            return TranscriptResponse("premature response", stop_reason="end_turn")
+        return None
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        fake_read_response,
+    )
+
+    try:
+        q = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = q["session_id"]
+
+        # Bump counter before the transcript path fires
+        request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+
+        # Give the transcript poller a moment to observe end_turn but not complete
+        import time
+        time.sleep(1.0)
+
+        # Request should still be active (not completed)
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] == q["request_id"], (
+            "request was completed prematurely while bg agent still pending"
+        )
+
+        # Finish the bg agent and let a real Stop complete the request
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "final response", "cwd": str(tmp_path)},
+        )
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -192,12 +192,14 @@ def prepare_launch_spec(
     policy_file.write_text(
         json.dumps({"allow": allow_rules, "disallow": disallow_rules}), encoding="utf-8"
     )
+    base_url = callback_base_url.rstrip("/")
     merged = write_merged_settings(
         directory=route_dir,
-        callback_url=f"{callback_base_url.rstrip('/')}/hook/stop",
+        callback_url=f"{base_url}/hook/stop",
         base_settings_path_or_json=session.metadata.get("settings_path") or None,
         include_pretool_hook=include_pretool_hook,
         policy_file=policy_file,
+        agent_started_url=f"{base_url}/hook/agent-started" if include_pretool_hook else None,
     )
     mcp_log_path = route_dir / "mcp-stdio.log"
     stdout_path = route_dir / "claude.stdout.log"

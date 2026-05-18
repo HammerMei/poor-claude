@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poor-claude"
-version = "0.2.2"
+version = "0.2.3"
 description = "Drop-in replacement for `claude -p` that routes prompts through persistent interactive Claude Code sessions, keeping usage under your subscription."
 readme = "README.md"
 license = { text = "MIT" }

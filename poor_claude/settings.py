@@ -41,11 +41,31 @@ def stop_hook_command(callback_url: str) -> str:
     )
 
 
+def subagent_stop_hook_command(callback_url: str) -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(project_root)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    return " ".join(
+        [
+            f"PYTHONPATH={shlex.quote(pythonpath)}",
+            shlex.quote(sys.executable),
+            "-m",
+            "poor_claude.hooks.subagent_stop_hook",
+            "--poor-claude-managed",
+            "--callback-url",
+            shlex.quote(callback_url),
+        ]
+    )
+
+
 def pretool_hook_command(
     log_path: Path | None = None,
     extra_allow_rules: list[str] | None = None,
     extra_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
+    agent_started_url: str | None = None,
 ) -> str:
     project_root = Path(__file__).resolve().parents[1]
     existing_pythonpath = os.environ.get("PYTHONPATH")
@@ -67,6 +87,8 @@ def pretool_hook_command(
         command += ["--disallow", shlex.quote(rule)]
     if policy_file is not None:
         command += ["--policy-file", shlex.quote(str(policy_file))]
+    if agent_started_url is not None:
+        command += ["--agent-started-url", shlex.quote(agent_started_url)]
     return " ".join(command)
 
 
@@ -78,8 +100,17 @@ def build_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
+    agent_started_url: str | None = None,
 ) -> dict:
-    """Build settings that are passed via `claude --settings <local-file>`."""
+    """Build settings that are passed via `claude --settings <local-file>`.
+
+    When *agent_started_url* is provided the pretool hook notifies the control
+    server when a background Agent tool call is allowed, and a SubagentStop hook
+    is added that notifies the server when a subagent session ends.  Together
+    these allow the Stop hook to wait for all background agents to finish before
+    signalling ACG that a request is complete (fixes the premature-completion bug
+    when Claude uses ``Agent(run_in_background=True)``).
+    """
     hooks: dict = {}
     if include_pretool_hook:
         log_path = permission_log_path.parent / "pretool-hook.log" if permission_log_path is not None else None
@@ -94,6 +125,7 @@ def build_settings(
                             extra_allow_rules=extra_pretool_allow_rules,
                             extra_disallow_rules=extra_pretool_disallow_rules,
                             policy_file=policy_file,
+                            agent_started_url=agent_started_url,
                         ),
                     }
                 ],
@@ -109,6 +141,20 @@ def build_settings(
             ]
         }
     ]
+    if agent_started_url is not None:
+        # Derive the subagent-stop URL from agent_started_url by replacing the
+        # path suffix.  Both endpoints share the same daemon base URL.
+        subagent_stop_url = agent_started_url.replace("/hook/agent-started", "/hook/subagent-stop")
+        hooks["SubagentStop"] = [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": subagent_stop_hook_command(subagent_stop_url),
+                    }
+                ]
+            }
+        ]
     return {"hooks": hooks}
 
 
@@ -240,6 +286,7 @@ def write_merged_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
+    agent_started_url: str | None = None,
 ) -> GeneratedSettings:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "claude-settings.merged.json"
@@ -257,6 +304,7 @@ def write_merged_settings(
             extra_pretool_allow_rules=extra_pretool_allow_rules,
             extra_pretool_disallow_rules=extra_pretool_disallow_rules,
             policy_file=policy_file,
+            agent_started_url=agent_started_url,
         ),
     )
     _write_json_atomic(path, data)

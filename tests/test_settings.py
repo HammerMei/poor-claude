@@ -10,6 +10,7 @@ from poor_claude.settings import (
     read_settings,
     strip_poor_claude_managed_settings,
     stop_hook_command,
+    subagent_stop_hook_command,
     write_project_local_settings,
     write_merged_settings,
     write_settings,
@@ -239,3 +240,63 @@ def test_ensure_skip_dangerous_mode_prompt_is_noop_when_already_set(tmp_path) ->
     ensure_skip_dangerous_mode_prompt(path)
     assert path.stat().st_mtime_ns == mtime_before, "file should not be rewritten when key already set"
     assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
+def test_subagent_stop_hook_command_uses_local_module() -> None:
+    command = subagent_stop_hook_command("http://127.0.0.1:1234/hook/subagent-stop")
+    assert sys.executable in command
+    assert "-m poor_claude.hooks.subagent_stop_hook" in command
+    assert "--poor-claude-managed" in command
+    assert "PYTHONPATH=" in command
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in command
+
+
+def test_build_settings_without_agent_started_url_has_no_subagent_stop_hook() -> None:
+    settings = build_settings("http://127.0.0.1:1234/hook/stop")
+    assert "SubagentStop" not in settings["hooks"]
+    pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--agent-started-url" not in pretool_cmd
+
+
+def test_build_settings_with_agent_started_url_adds_subagent_stop_hook() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+    )
+    assert "SubagentStop" in settings["hooks"]
+    subagent_hook = settings["hooks"]["SubagentStop"][0]["hooks"][0]
+    assert subagent_hook["type"] == "command"
+    assert "poor_claude.hooks.subagent_stop_hook" in subagent_hook["command"]
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook["command"]
+
+
+def test_build_settings_with_agent_started_url_adds_flag_to_pretool_hook() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+    )
+    pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--agent-started-url" in pretool_cmd
+    assert "http://127.0.0.1:1234/hook/agent-started" in pretool_cmd
+
+
+def test_build_settings_with_agent_started_url_omits_subagent_when_no_pretool() -> None:
+    # When pretool hook is disabled (bypassPermissions mode), SubagentStop is
+    # still added because the agent_started_url was explicitly provided.
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        include_pretool_hook=False,
+        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+    )
+    # SubagentStop is present (it doesn't depend on pretool_hook)
+    assert "SubagentStop" in settings["hooks"]
+    assert "PreToolUse" not in settings["hooks"]
+
+
+def test_strip_poor_claude_managed_settings_removes_subagent_stop_hook() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+    )
+    stripped = strip_poor_claude_managed_settings(settings)
+    assert stripped == {}

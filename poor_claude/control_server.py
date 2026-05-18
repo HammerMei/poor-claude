@@ -415,13 +415,21 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     with state.lock:
                         if state.registry._sessions.get(session.route_key) is not session:
                             raise RuntimeError("session route no longer exists")
-                        state.registry.finish_request_for_route(
-                            route=session.route_key,
-                            request_id=request.request_id,
-                            response=transcript_response,
-                        )
-                        state.condition.notify_all()
-                    return transcript_response
+                        if session.pending_background_agents > 0:
+                            # Background agents are still running; the transcript
+                            # shows the premature "launched" turn.  Reset the
+                            # stability timer so we don't complete with this
+                            # (premature) response after the counter drops to zero
+                            # — the final response must appear and be stable first.
+                            stable_transcript_since = time.time()
+                        else:
+                            state.registry.finish_request_for_route(
+                                route=session.route_key,
+                                request_id=request.request_id,
+                                response=transcript_response,
+                            )
+                            state.condition.notify_all()
+                            return transcript_response
         elif time.time() >= next_candidate_refresh:
             refreshed_candidates = transcript_candidates(session_id=session.session_id, workdir=session.workdir)
             for candidate in refreshed_candidates:
@@ -581,6 +589,12 @@ def make_handler(state: ControlState):
                 return
             if self.path == "/hook/stop":
                 self._handle_stop_hook()
+                return
+            if self.path == "/hook/agent-started":
+                self._handle_agent_started_hook()
+                return
+            if self.path == "/hook/subagent-stop":
+                self._handle_subagent_stop_hook()
                 return
             if self.path == "/shutdown":
                 with state.lock:
@@ -787,6 +801,13 @@ def make_handler(state: ControlState):
                     if request_id in session.completed_request_ids:
                         self._send_json(200, {"ok": True, "duplicate": True})
                         return
+                    if session.pending_background_agents > 0:
+                        # Background agents are still running.  Defer completion
+                        # until SubagentStop fires for each of them and the counter
+                        # reaches zero.  The final Stop (after Claude resumes and
+                        # writes the real response) will complete the request.
+                        self._send_json(200, {"ok": True, "deferred": True})
+                        return
                     state.registry.finish_request_for_route(
                         route=session.route_key,
                         request_id=request_id,
@@ -794,6 +815,57 @@ def make_handler(state: ControlState):
                     )
                     state.condition.notify_all()
                 self._send_json(200, {"ok": True})
+            except Exception as exc:
+                self._send_error(400, str(exc))
+
+        def _handle_agent_started_hook(self) -> None:
+            """Increment the pending-background-agents counter for a session.
+
+            Called by the pretool hook when it sees a background Agent tool call
+            that it is about to allow.  This must be called (and the HTTP response
+            received) before the PreToolUse hook exits so the counter is set
+            before the first (premature) Stop hook fires.
+            """
+            try:
+                payload = self._read_json()
+                session_id = _canonical_session_id(payload.get("session_id"))
+                if session_id is None:
+                    raise RuntimeError("agent-started payload missing session_id")
+                workdir = str(payload.get("cwd") or os.getcwd())
+                with state.lock:
+                    session = state.registry.get(session_id, workdir=workdir)
+                    if session is None:
+                        # Session may not exist yet (race with session creation);
+                        # ignore silently — the counter starts at 0 and this is
+                        # best-effort.
+                        self._send_json(200, {"ok": True, "no_session": True})
+                        return
+                    session.pending_background_agents += 1
+                self._send_json(200, {"ok": True, "pending": session.pending_background_agents})
+            except Exception as exc:
+                self._send_error(400, str(exc))
+
+        def _handle_subagent_stop_hook(self) -> None:
+            """Decrement the pending-background-agents counter for a session.
+
+            Called by the SubagentStop hook when a subagent session ends.
+            Decrements the counter (floor 0) and wakes up the condition variable
+            so the Stop hook handler or _wait_for_response() can re-evaluate.
+            """
+            try:
+                payload = self._read_json()
+                session_id = _canonical_session_id(payload.get("session_id"))
+                if session_id is None:
+                    raise RuntimeError("subagent-stop payload missing session_id")
+                workdir = str(payload.get("cwd") or os.getcwd())
+                with state.lock:
+                    session = state.registry.get(session_id, workdir=workdir)
+                    if session is None:
+                        self._send_json(200, {"ok": True, "no_session": True})
+                        return
+                    session.pending_background_agents = max(0, session.pending_background_agents - 1)
+                    state.condition.notify_all()
+                self._send_json(200, {"ok": True, "pending": session.pending_background_agents})
             except Exception as exc:
                 self._send_error(400, str(exc))
 

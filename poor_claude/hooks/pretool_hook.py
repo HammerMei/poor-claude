@@ -154,8 +154,12 @@ def _post_agent_started_best_effort(url: str, session_id: str, cwd: str) -> None
         )
         with urllib.request.urlopen(req, timeout=2) as response:  # noqa: S310
             response.read()
-    except Exception:  # noqa: BLE001
-        pass  # best-effort: never block the tool call on notification failure
+    except Exception as exc:  # noqa: BLE001
+        # Log to stderr so operators can diagnose lost increments (a missed
+        # increment means the Stop hook won't defer and will complete early —
+        # the same symptom as the bug this feature fixes).
+        print(f"poor-claude: agent-started notification failed: {exc}", file=sys.stderr)
+        # Never block the tool call regardless.
 
 
 def main(argv: list[str] | None = None) -> int:

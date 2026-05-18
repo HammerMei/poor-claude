@@ -200,6 +200,7 @@ def prepare_launch_spec(
         include_pretool_hook=include_pretool_hook,
         policy_file=policy_file,
         agent_started_url=f"{base_url}/hook/agent-started" if include_pretool_hook else None,
+        subagent_stop_url=f"{base_url}/hook/subagent-stop" if include_pretool_hook else None,
     )
     mcp_log_path = route_dir / "mcp-stdio.log"
     stdout_path = route_dir / "claude.stdout.log"

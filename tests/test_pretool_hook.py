@@ -555,6 +555,10 @@ def test_pretool_hook_posts_agent_started_in_non_default_mode(monkeypatch) -> No
     server.shutdown()
 
 
-def test_post_agent_started_best_effort_swallows_connection_error() -> None:
-    # Should not raise even if the server is unreachable
+def test_post_agent_started_best_effort_swallows_connection_error(capsys) -> None:
+    # Should not raise even if the server is unreachable, but must log to stderr
+    # so operators can diagnose lost increments (a missed increment causes the
+    # same premature-completion symptom the feature is meant to fix).
     _post_agent_started_best_effort("http://127.0.0.1:1/hook/agent-started", "sid", "/cwd")
+    captured = capsys.readouterr()
+    assert "agent-started notification failed" in captured.err

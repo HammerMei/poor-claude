@@ -1790,3 +1790,79 @@ def test_transcript_path_defers_when_background_agents_pending(tmp_path, monkeyp
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_transcript_path_does_not_complete_immediately_after_subagent_stop(tmp_path, monkeypatch) -> None:
+    """After SubagentStop fires and counter drops to 0, the transcript path must
+    NOT complete with the stale deferred response.  The fix clears
+    stable_transcript_response / stable_transcript_signature on deferral so
+    the stability timer restarts — at least transcript_quiet_seconds (0.5 s) must
+    elapse before completion can happen via that path."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    # Transcript always returns the same "premature" response with end_turn —
+    # it never updates to a "real" final response in this scenario.
+    def fake_read_response(*_args, **_kwargs):
+        return TranscriptResponse("premature response", stop_reason="end_turn")
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        fake_read_response,
+    )
+
+    try:
+        q = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 8,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = q["session_id"]
+
+        # Increment counter so the first transcript-path fire defers.
+        request_json(
+            "POST",
+            f"{address}/hook/agent-started",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+
+        # Wait long enough for the transcript path to fire (>0.5s quiet period)
+        # and then defer (clearing stable values).
+        time.sleep(1.2)
+
+        # Now fire SubagentStop: counter drops to 0.
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path)},
+        )
+
+        # Immediately after counter drops to 0 the request should still be
+        # active — the fix cleared stable_transcript_response so the timer
+        # must restart; 0.1 s is well inside the 0.5 s quiet window.
+        time.sleep(0.1)
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] == q["request_id"], (
+            "request completed too quickly after subagent-stop — "
+            "stable_transcript_response was probably not cleared on deferral"
+        )
+
+        # Finish cleanly via Stop hook (transcript stays stale; Stop hook wins).
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "real response", "cwd": str(tmp_path)},
+        )
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()

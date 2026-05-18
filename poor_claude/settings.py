@@ -101,6 +101,7 @@ def build_settings(
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
     agent_started_url: str | None = None,
+    subagent_stop_url: str | None = None,
 ) -> dict:
     """Build settings that are passed via `claude --settings <local-file>`.
 
@@ -110,6 +111,10 @@ def build_settings(
     these allow the Stop hook to wait for all background agents to finish before
     signalling ACG that a request is complete (fixes the premature-completion bug
     when Claude uses ``Agent(run_in_background=True)``).
+
+    *subagent_stop_url* is the URL for the SubagentStop hook endpoint.  When
+    omitted it is derived from *agent_started_url* by replacing ``/hook/agent-started``
+    with ``/hook/subagent-stop``; pass it explicitly to avoid that string surgery.
     """
     hooks: dict = {}
     if include_pretool_hook:
@@ -142,9 +147,18 @@ def build_settings(
         }
     ]
     if agent_started_url is not None:
-        # Derive the subagent-stop URL from agent_started_url by replacing the
-        # path suffix.  Both endpoints share the same daemon base URL.
-        subagent_stop_url = agent_started_url.replace("/hook/agent-started", "/hook/subagent-stop")
+        if subagent_stop_url is None:
+            # Derive from agent_started_url as a convenience for callers that
+            # follow the /hook/agent-started convention.  Raise early rather than
+            # silently wiring the wrong endpoint (str.replace returns the original
+            # string unchanged when the substring is absent).
+            if "/hook/agent-started" not in agent_started_url:
+                raise ValueError(
+                    f"Cannot derive subagent_stop_url from {agent_started_url!r}: "
+                    "the URL must contain '/hook/agent-started', "
+                    "or pass subagent_stop_url explicitly."
+                )
+            subagent_stop_url = agent_started_url.replace("/hook/agent-started", "/hook/subagent-stop")
         hooks["SubagentStop"] = [
             {
                 "hooks": [
@@ -287,6 +301,7 @@ def write_merged_settings(
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
     agent_started_url: str | None = None,
+    subagent_stop_url: str | None = None,
 ) -> GeneratedSettings:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "claude-settings.merged.json"
@@ -305,6 +320,7 @@ def write_merged_settings(
             extra_pretool_disallow_rules=extra_pretool_disallow_rules,
             policy_file=policy_file,
             agent_started_url=agent_started_url,
+            subagent_stop_url=subagent_stop_url,
         ),
     )
     _write_json_atomic(path, data)

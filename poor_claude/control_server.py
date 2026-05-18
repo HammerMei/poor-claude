@@ -418,10 +418,17 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         if session.pending_background_agents > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
-                            # stability timer so we don't complete with this
-                            # (premature) response after the counter drops to zero
-                            # — the final response must appear and be stable first.
+                            # stability timer AND clear the stable-response bookmarks
+                            # so the next polling cycle must observe a genuinely new,
+                            # stable response before completing.
+                            # Without clearing stable_transcript_response /
+                            # _signature, a SubagentStop that fires while the timer
+                            # is running would set the counter to 0 and the very next
+                            # loop iteration would immediately complete with this
+                            # stale response (same signature → timer already expired).
                             stable_transcript_since = time.time()
+                            stable_transcript_response = None  # force re-stabilisation
+                            stable_transcript_signature = None
                         else:
                             state.registry.finish_request_for_route(
                                 route=session.route_key,

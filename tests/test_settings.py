@@ -280,17 +280,36 @@ def test_build_settings_with_agent_started_url_adds_flag_to_pretool_hook() -> No
     assert "http://127.0.0.1:1234/hook/agent-started" in pretool_cmd
 
 
-def test_build_settings_with_agent_started_url_omits_subagent_when_no_pretool() -> None:
-    # When pretool hook is disabled (bypassPermissions mode), SubagentStop is
-    # still added because the agent_started_url was explicitly provided.
+def test_build_settings_with_agent_started_url_keeps_subagent_stop_hook_when_pretool_excluded() -> None:
+    # SubagentStop must still be registered even when the pretool hook is
+    # disabled (bypassPermissions mode): background agents can still run, and
+    # the control server still needs the decrement signal.
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
         include_pretool_hook=False,
         agent_started_url="http://127.0.0.1:1234/hook/agent-started",
     )
-    # SubagentStop is present (it doesn't depend on pretool_hook)
     assert "SubagentStop" in settings["hooks"]
     assert "PreToolUse" not in settings["hooks"]
+
+
+def test_build_settings_accepts_explicit_subagent_stop_url() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        subagent_stop_url="http://127.0.0.1:1234/hook/subagent-stop",
+    )
+    subagent_hook_cmd = settings["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook_cmd
+
+
+def test_build_settings_raises_when_agent_started_url_cannot_be_derived() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="subagent_stop_url"):
+        build_settings(
+            "http://127.0.0.1:1234/hook/stop",
+            agent_started_url="http://127.0.0.1:1234/hook/notify",  # missing /hook/agent-started
+        )
 
 
 def test_strip_poor_claude_managed_settings_removes_subagent_stop_hook() -> None:

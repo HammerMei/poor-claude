@@ -132,7 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = parse_stop_hook_stdin(sys.stdin.read())
         post_callback(args.callback_url, payload)
     except Exception as exc:  # pragma: no cover - exercised through subprocess later
-        print(f"poor-claude stop hook failed: {exc}", file=sys.stderr)
+        body = exc.read().decode() if hasattr(exc, "read") else ""
+        detail = f" | body: {body}" if body else ""
+        print(f"poor-claude stop hook failed: {exc}{detail}", file=sys.stderr)
         return 1
     return 0
 

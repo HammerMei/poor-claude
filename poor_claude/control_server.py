@@ -771,7 +771,18 @@ def make_handler(state: ControlState):
                     if session is None:
                         raise RuntimeError("session route not found for Stop hook")
                     if not isinstance(request_id, str):
-                        raise RuntimeError("Stop hook payload missing request_id")
+                        # The stop hook payload does not carry a poor-claude request_id
+                        # (Claude Code has no knowledge of it).  Fall back to the
+                        # session's active request — the Stop hook fires after Claude
+                        # finishes responding, so the active request IS the one we want
+                        # to complete.
+                        if session.active_request is not None:
+                            request_id = session.active_request.request_id
+                        else:
+                            # No active request — either already completed (duplicate
+                            # hook invocation) or the request was cancelled/timed out.
+                            self._send_json(200, {"ok": True, "no_active_request": True})
+                            return
                     if request_id in session.completed_request_ids:
                         self._send_json(200, {"ok": True, "duplicate": True})
                         return

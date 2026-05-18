@@ -141,7 +141,27 @@ def merge_settings(base: dict, poor_claude_settings: dict) -> dict:
         existing = merged_hooks.setdefault(event_name, [])
         if not isinstance(existing, list):
             raise ValueError(f"hooks.{event_name} must be a list")
-        existing.extend(deepcopy(hook_entries))
+        # Strip stale poor-claude-managed hooks before adding fresh ones.
+        # This prevents duplicate stop hook invocations when the base settings
+        # already contain poor-claude hooks (e.g. from a previous session or a
+        # global ~/.claude/settings.json that was not cleaned up).
+        deduplicated: list = []
+        for entry in existing:
+            if not isinstance(entry, dict):
+                deduplicated.append(entry)
+                continue
+            entry_copy = deepcopy(entry)
+            hook_list = entry_copy.get("hooks")
+            if isinstance(hook_list, list):
+                retained = [h for h in hook_list if not _is_poor_claude_managed_hook(h)]
+                if retained:
+                    entry_copy["hooks"] = retained
+                    deduplicated.append(entry_copy)
+                # else: all hooks were poor-claude-managed — drop the whole entry
+            else:
+                deduplicated.append(entry_copy)
+        deduplicated.extend(deepcopy(hook_entries))
+        merged_hooks[event_name] = deduplicated
     return merged
 
 

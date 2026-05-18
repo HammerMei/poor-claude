@@ -1240,7 +1240,8 @@ def test_control_server_delete_does_not_hold_state_lock_while_stopping_process(t
         server.server_close()
 
 
-def test_control_server_rejects_stop_hook_without_request_id(tmp_path) -> None:
+def test_control_server_stop_hook_falls_back_to_active_request_when_no_request_id(tmp_path) -> None:
+    """Stop hook without request_id falls back to the session's active request."""
     server, address = start_test_server()
     try:
         request_json(
@@ -1248,16 +1249,37 @@ def test_control_server_rejects_stop_hook_without_request_id(tmp_path) -> None:
             f"{address}/requests",
             {"session_id": "demo", "prompt": "hello", "workdir": str(tmp_path)},
         )
-        try:
-            request_json(
-                "POST",
-                f"{address}/hook/stop",
-                {"session_id": "demo", "response": "late", "cwd": str(tmp_path)},
-            )
-        except Exception as exc:
-            assert "missing request_id" in str(exc)
-        else:  # pragma: no cover
-            raise AssertionError("expected missing request_id rejection")
+        # Stop hook without request_id — should complete the active request via fallback
+        result = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "response": "done", "cwd": str(tmp_path)},
+        )
+        assert result.get("ok") is True
+        assert "duplicate" not in result
+        assert "no_active_request" not in result
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_stop_hook_no_active_request_returns_ok(tmp_path) -> None:
+    """Stop hook without request_id and no active request returns ok (spurious hook call)."""
+    server, address = start_test_server()
+    try:
+        # Create a session but send no prompt — no active request
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "idle", "workdir": str(tmp_path)},
+        )
+        result = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "idle", "response": "", "cwd": str(tmp_path)},
+        )
+        assert result.get("ok") is True
+        assert result.get("no_active_request") is True
     finally:
         server.shutdown()
         server.server_close()

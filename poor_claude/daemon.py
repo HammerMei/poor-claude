@@ -58,10 +58,16 @@ def default_state_path() -> Path:
     return Path(os.environ.get("POOR_CLAUDE_STATE", "~/.poor-claude/daemon.json")).expanduser()
 
 
-def start_daemon(*, state_path: Path | None = None, timeout_seconds: float = 5.0) -> DaemonState:
-    """Start the background control daemon and wait for its state file."""
+def start_daemon(*, state_path: Path | None = None, timeout_seconds: float = 30.0) -> DaemonState:
+    """Start the background control daemon and wait for its state file.
+
+    Spawns the daemon subprocess if not already running, then polls until the
+    daemon writes its state file AND its HTTP server responds to /healthz.
+    Uses a generous default timeout because Python cold-start (first import of
+    the module tree) can take several seconds on some machines.
+    """
     path = default_state_path() if state_path is None else state_path
-    existing = discover_state(path)
+    existing = _discover_and_verify(path)
     if existing is not None:
         return existing
 
@@ -81,8 +87,24 @@ def start_daemon(*, state_path: Path | None = None, timeout_seconds: float = 5.0
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        state = discover_state(path)
+        state = _discover_and_verify(path)
         if state is not None:
             return state
-        time.sleep(0.05)
+        time.sleep(0.1)
     raise TimeoutError("timed out waiting for poor-claude daemon to start")
+
+
+def _discover_and_verify(path: Path) -> DaemonState | None:
+    """Read daemon state and confirm the HTTP server is actually responding."""
+    state = discover_state(path)
+    if state is None:
+        return None
+    # Confirm the HTTP server is up — daemon.json may exist while the server
+    # is still binding its port (small window, but avoids a confusing error).
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{state.address}/healthz", timeout=1.0) as resp:  # noqa: S310
+            resp.read()
+        return state
+    except OSError:
+        return None

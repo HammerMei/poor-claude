@@ -393,7 +393,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     state.condition.notify_all()
                 raise RuntimeError("daemon is shutting down")
             if active is None:
-                return request.response or ""
+                final = request.response or ""
+                intermediate = request.intermediate_response
+                if intermediate and intermediate != final:
+                    return f"{intermediate}\n\n{final}"
+                return final
 
         transcript_response = None
         transcript_stop_reason = None
@@ -453,6 +457,12 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                                 session.pending_background_agent_ids.add(aid)
                         if newly_discovered:
                             bg_agent_detected = True
+                            # First-one-wins: store the premature transcript
+                            # response as the intermediate output so it can be
+                            # prepended to the final response.  Guard against
+                            # the Stop hook path having already set this.
+                            if request.intermediate_response is None and stable_transcript_response:
+                                request.intermediate_response = stable_transcript_response
                         if len(session.pending_background_agent_ids) > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
@@ -881,6 +891,11 @@ def make_handler(state: ControlState):
                         # until SubagentStop fires for each of them and the set
                         # empties.  The final Stop (after Claude resumes and
                         # writes the real response) will complete the request.
+                        # Save the current (premature) response as the intermediate
+                        # output so it can be prepended to the final response later.
+                        active_req = session.active_request
+                        if active_req is not None and active_req.intermediate_response is None and response:
+                            active_req.intermediate_response = response
                         self._send_json(200, {"ok": True, "deferred": True})
                         return
                     state.registry.finish_request_for_route(

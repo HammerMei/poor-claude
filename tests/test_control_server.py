@@ -1990,6 +1990,89 @@ def test_stop_hook_defers_via_transcript_scan(tmp_path) -> None:
         server.server_close()
 
 
+def test_intermediate_response_prepended_to_final_via_stop_hook_path(tmp_path) -> None:
+    """When the Stop hook defers, the intermediate response is prepended to the final response.
+
+    The first Stop hook fires with "LAUNCHED" (deferred because a bg agent is pending).
+    After SubagentStop clears the pending set, the second Stop hook fires with "BG-DONE".
+    _wait_for_response must return "LAUNCHED\\n\\nBG-DONE".
+    """
+    server, address = start_test_server()
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "launch bg agent",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        request_id = listed["sessions"][0]["active_request"]
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bg_agent_transcript(transcript, request_id=request_id, agent_id="bg-001")
+
+        # First Stop hook — deferred because bg agent is pending.
+        first_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "LAUNCHED",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert first_stop.get("deferred") is True
+
+        # SubagentStop fires — pending clears.
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "bg-001"},
+        )
+
+        # Second Stop hook fires with real final response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "BG-DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "LAUNCHED\n\nBG-DONE"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_stop_hook_transcript_scan_race_subagent_stops_first(tmp_path) -> None:
     """SubagentStop fires before the Stop hook scan: completed_agent_ids prevents defer loop."""
     server, address = start_test_server()
@@ -2129,7 +2212,9 @@ def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_alrea
         )
 
         req_thread.join(timeout=3)
-        assert result_box.get("result", {}).get("response") == "BG-DONE"
+        # Response must combine the intermediate "LAUNCHED" turn with the final
+        # "BG-DONE" turn separated by a blank line.
+        assert result_box.get("result", {}).get("response") == "LAUNCHED\n\nBG-DONE"
         listed = request_json("GET", f"{address}/sessions")
         assert listed["sessions"][0]["active_request"] is None
     finally:

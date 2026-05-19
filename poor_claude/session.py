@@ -24,6 +24,11 @@ class PendingRequest:
     created_at: float
     timeout_seconds: int
     response: str | None = None
+    # First Claude turn before background agents complete (e.g. "LAUNCHED").
+    # Set once (first-one-wins) by either _handle_stop_hook (when it defers) or
+    # _wait_for_response (when it detects a background agent in the transcript).
+    # Prepended to the final response so callers see the full turn history.
+    intermediate_response: str | None = None
 
 
 @dataclass

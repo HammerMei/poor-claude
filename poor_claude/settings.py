@@ -403,6 +403,49 @@ def ensure_skip_dangerous_mode_prompt(global_settings_path: Path | None = None) 
     _write_json_atomic(path, data)
 
 
+def ensure_workspace_trust(workdir: Path, global_settings_path: Path | None = None) -> None:
+    """Write hasTrustDialogAccepted=true for *workdir* to ~/.claude/settings.json.
+
+    Claude Code shows a "Quick safety check: Is this a project you trust?" prompt
+    the first time it opens a directory.  Writing ``hasTrustDialogAccepted=true``
+    under ``projects[<workdir>]`` in the global user settings is equivalent to
+    having accepted the prompt once interactively — exactly what Claude Code
+    itself does after the user clicks "Yes, I trust this folder".  Callers that
+    set ``auto_accept_workspace_trust=True`` have already opted in to unattended
+    mode, so pre-writing the key is the correct and reliable approach (vs.
+    injecting key sequences into the PTY, which is fragile).
+
+    The project key matches what Claude Code computes via
+    ``k58(path.resolve(workdir))``, which on POSIX is
+    ``os.path.normpath(os.path.abspath(workdir))``.  ``os.path.abspath`` is used
+    intentionally (not ``Path.resolve``) because Node's ``path.resolve`` does NOT
+    follow symlinks, whereas Python's ``Path.resolve`` does — using the wrong one
+    would silently fail on symlinked workdirs.
+    """
+    path = global_settings_path or Path.home() / ".claude" / "settings.json"
+    # Compute the project key the same way Claude Code does in k58(path.resolve(q)):
+    # normalize + make absolute, no symlink resolution.
+    key = os.path.normpath(os.path.abspath(str(workdir)))
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+        data["projects"] = projects
+    project = projects.get(key)
+    if not isinstance(project, dict):
+        project = {}
+        projects[key] = project
+    if project.get("hasTrustDialogAccepted") is True:
+        return  # already set, nothing to do
+    project["hasTrustDialogAccepted"] = True
+    _write_json_atomic(path, data)
+
+
 def cleanup_project_local_settings(project_dir: Path) -> None:
     path = project_dir / ".claude" / "settings.local.json"
     if not path.exists():

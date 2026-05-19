@@ -14,7 +14,7 @@ from pathlib import Path
 
 from poor_claude.mcp_router import CHANNEL_NAME
 from poor_claude.mcp_validation import build_mcp_config
-from poor_claude.settings import cleanup_project_local_settings, ensure_skip_dangerous_mode_prompt, write_merged_settings
+from poor_claude.settings import cleanup_project_local_settings, ensure_skip_dangerous_mode_prompt, ensure_workspace_trust, write_merged_settings
 from poor_claude.session import SessionRecord
 
 
@@ -180,6 +180,11 @@ def prepare_launch_spec(
         # human clicks "Yes, I accept" — we just do it upfront since the operator
         # opted in by setting auto_accept_workspace_trust=True.
         ensure_skip_dangerous_mode_prompt()
+        # Pre-write hasTrustDialogAccepted=true for this workdir so Claude Code
+        # never shows the "Quick safety check: Is this a project you trust?" prompt.
+        # Same pattern: settings-file injection is deterministic; PTY key injection
+        # is fragile and should not be used for safety-gate prompts.
+        ensure_workspace_trust(Path(session.workdir))
     # Write allow/disallow rules to a fixed path baked into the hook command once at
     # launch. The file is rewritten on every request so rule changes take effect
     # immediately — the hook reads it fresh on each invocation, no restart needed.
@@ -371,15 +376,6 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
         if "development-channels" not in accepted:
             # Option-1 is already highlighted by default; just confirm with Enter.
             return [b"\r"], "development-channels"
-    if (
-        "quick safety check" in text
-        and "yes, i trust this folder" in text
-        and "no, exit" in text
-        and "enter to confirm" in text
-    ):
-        if "workspace-trust" not in accepted:
-            # Option-1 ("Yes, I trust this folder") is already highlighted; confirm with Enter.
-            return [b"\r"], "workspace-trust"
     return None, None
 
 

@@ -6,6 +6,7 @@ from poor_claude.settings import (
     build_settings,
     cleanup_project_local_settings,
     ensure_skip_dangerous_mode_prompt,
+    ensure_workspace_trust,
     merge_settings,
     posttool_hook_command,
     read_settings,
@@ -344,3 +345,43 @@ def test_strip_poor_claude_managed_settings_removes_posttool_and_subagent_stop_h
     )
     stripped = strip_poor_claude_managed_settings(settings)
     assert stripped == {}
+
+
+def test_ensure_workspace_trust_creates_entry_when_none_exists(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    ensure_workspace_trust(tmp_path, path)
+    import os
+    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["projects"][key]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_workspace_trust_adds_to_existing_projects(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    other_key = "/some/other/project"
+    path.write_text(json.dumps({"projects": {other_key: {"hasTrustDialogAccepted": True}}}), encoding="utf-8")
+    ensure_workspace_trust(tmp_path, path)
+    import os
+    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["projects"][other_key]["hasTrustDialogAccepted"] is True
+    assert data["projects"][key]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_workspace_trust_is_noop_when_already_set(tmp_path) -> None:
+    import os
+    path = tmp_path / "settings.json"
+    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    original = {"projects": {key: {"hasTrustDialogAccepted": True, "otherKey": "preserved"}}}
+    path.write_text(json.dumps(original), encoding="utf-8")
+    mtime_before = path.stat().st_mtime_ns
+    ensure_workspace_trust(tmp_path, path)
+    assert path.stat().st_mtime_ns == mtime_before, "file should not be rewritten when key already set"
+
+
+def test_ensure_workspace_trust_preserves_other_settings_in_file(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"skipDangerousModePermissionPrompt": True}), encoding="utf-8")
+    ensure_workspace_trust(tmp_path, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["skipDangerousModePermissionPrompt"] is True

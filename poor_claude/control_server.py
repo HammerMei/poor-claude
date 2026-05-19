@@ -415,17 +415,17 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     with state.lock:
                         if state.registry._sessions.get(session.route_key) is not session:
                             raise RuntimeError("session route no longer exists")
-                        if session.pending_background_agents > 0:
+                        if len(session.pending_background_agent_ids) > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
                             # stability timer AND clear the stable-response bookmarks
                             # so the next polling cycle must observe a genuinely new,
                             # stable response before completing.
                             # Without clearing stable_transcript_response /
-                            # _signature, a SubagentStop that fires while the timer
-                            # is running would set the counter to 0 and the very next
-                            # loop iteration would immediately complete with this
-                            # stale response (same signature → timer already expired).
+                            # _signature, a SubagentStop that fires while the set
+                            # empties and the very next loop iteration would
+                            # immediately complete with this stale response (same
+                            # signature → timer already expired).
                             stable_transcript_since = time.time()
                             stable_transcript_response = None  # force re-stabilisation
                             stable_transcript_signature = None
@@ -597,8 +597,8 @@ def make_handler(state: ControlState):
             if self.path == "/hook/stop":
                 self._handle_stop_hook()
                 return
-            if self.path == "/hook/agent-started":
-                self._handle_agent_started_hook()
+            if self.path == "/hook/agent-launched":
+                self._handle_agent_launched_hook()
                 return
             if self.path == "/hook/subagent-stop":
                 self._handle_subagent_stop_hook()
@@ -808,10 +808,10 @@ def make_handler(state: ControlState):
                     if request_id in session.completed_request_ids:
                         self._send_json(200, {"ok": True, "duplicate": True})
                         return
-                    if session.pending_background_agents > 0:
+                    if len(session.pending_background_agent_ids) > 0:
                         # Background agents are still running.  Defer completion
-                        # until SubagentStop fires for each of them and the counter
-                        # reaches zero.  The final Stop (after Claude resumes and
+                        # until SubagentStop fires for each of them and the set
+                        # empties.  The final Stop (after Claude resumes and
                         # writes the real response) will complete the request.
                         self._send_json(200, {"ok": True, "deferred": True})
                         return
@@ -825,54 +825,63 @@ def make_handler(state: ControlState):
             except Exception as exc:
                 self._send_error(400, str(exc))
 
-        def _handle_agent_started_hook(self) -> None:
-            """Increment the pending-background-agents counter for a session.
+        def _handle_agent_launched_hook(self) -> None:
+            """Register a background-agent agentId for a session.
 
-            Called by the pretool hook when it sees a background Agent tool call
-            that it is about to allow.  This must be called (and the HTTP response
-            received) before the PreToolUse hook exits so the counter is set
-            before the first (premature) Stop hook fires.
+            Called by the PostToolUse hook when it sees a background Agent response
+            (isAsync: true).  The agentId is added to the session's
+            pending_background_agent_ids set so the Stop hook knows to defer until
+            this agent's SubagentStop fires.
             """
             try:
                 payload = self._read_json()
                 session_id = _canonical_session_id(payload.get("session_id"))
                 if session_id is None:
-                    raise RuntimeError("agent-started payload missing session_id")
+                    raise RuntimeError("agent-launched payload missing session_id")
+                agent_id = payload.get("agent_id")
+                if not isinstance(agent_id, str) or not agent_id:
+                    raise RuntimeError("agent-launched payload missing agent_id")
                 workdir = str(payload.get("cwd") or os.getcwd())
                 with state.lock:
                     session = state.registry.get(session_id, workdir=workdir)
                     if session is None:
                         # Session may not exist yet (race with session creation);
-                        # ignore silently — the counter starts at 0 and this is
+                        # ignore silently — the set starts empty and this is
                         # best-effort.
                         self._send_json(200, {"ok": True, "no_session": True})
                         return
-                    session.pending_background_agents += 1
-                self._send_json(200, {"ok": True, "pending": session.pending_background_agents})
+                    session.pending_background_agent_ids.add(agent_id)
+                    pending_count = len(session.pending_background_agent_ids)
+                self._send_json(200, {"ok": True, "pending": pending_count})
             except Exception as exc:
                 self._send_error(400, str(exc))
 
         def _handle_subagent_stop_hook(self) -> None:
-            """Decrement the pending-background-agents counter for a session.
+            """Remove a completed background-agent agentId from the session's tracking set.
 
-            Called by the SubagentStop hook when a subagent session ends.
-            Decrements the counter (floor 0) and wakes up the condition variable
-            so the Stop hook handler or _wait_for_response() can re-evaluate.
+            Called by the SubagentStop hook when a subagent session ends.  Discards
+            the agentId from pending_background_agent_ids (a no-op if the id is
+            absent — safe for stale calls from sync agents) and wakes up the
+            condition variable so the Stop hook handler or _wait_for_response() can
+            re-evaluate.
             """
             try:
                 payload = self._read_json()
                 session_id = _canonical_session_id(payload.get("session_id"))
                 if session_id is None:
                     raise RuntimeError("subagent-stop payload missing session_id")
+                agent_id = payload.get("agent_id")
                 workdir = str(payload.get("cwd") or os.getcwd())
                 with state.lock:
                     session = state.registry.get(session_id, workdir=workdir)
                     if session is None:
                         self._send_json(200, {"ok": True, "no_session": True})
                         return
-                    session.pending_background_agents = max(0, session.pending_background_agents - 1)
+                    if isinstance(agent_id, str) and agent_id:
+                        session.pending_background_agent_ids.discard(agent_id)
+                    pending_count = len(session.pending_background_agent_ids)
                     state.condition.notify_all()
-                self._send_json(200, {"ok": True, "pending": session.pending_background_agents})
+                self._send_json(200, {"ok": True, "pending": pending_count})
             except Exception as exc:
                 self._send_error(400, str(exc))
 

@@ -60,12 +60,30 @@ def subagent_stop_hook_command(callback_url: str) -> str:
     )
 
 
+def posttool_hook_command(callback_url: str) -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(project_root)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    return " ".join(
+        [
+            f"PYTHONPATH={shlex.quote(pythonpath)}",
+            shlex.quote(sys.executable),
+            "-m",
+            "poor_claude.hooks.posttool_hook",
+            "--poor-claude-managed",
+            "--callback-url",
+            shlex.quote(callback_url),
+        ]
+    )
+
+
 def pretool_hook_command(
     log_path: Path | None = None,
     extra_allow_rules: list[str] | None = None,
     extra_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
-    agent_started_url: str | None = None,
 ) -> str:
     project_root = Path(__file__).resolve().parents[1]
     existing_pythonpath = os.environ.get("PYTHONPATH")
@@ -87,8 +105,6 @@ def pretool_hook_command(
         command += ["--disallow", shlex.quote(rule)]
     if policy_file is not None:
         command += ["--policy-file", shlex.quote(str(policy_file))]
-    if agent_started_url is not None:
-        command += ["--agent-started-url", shlex.quote(agent_started_url)]
     return " ".join(command)
 
 
@@ -100,21 +116,23 @@ def build_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
-    agent_started_url: str | None = None,
+    agent_launched_url: str | None = None,
     subagent_stop_url: str | None = None,
 ) -> dict:
     """Build settings that are passed via `claude --settings <local-file>`.
 
-    When *agent_started_url* is provided the pretool hook notifies the control
-    server when a background Agent tool call is allowed, and a SubagentStop hook
-    is added that notifies the server when a subagent session ends.  Together
-    these allow the Stop hook to wait for all background agents to finish before
-    signalling ACG that a request is complete (fixes the premature-completion bug
-    when Claude uses ``Agent(run_in_background=True)``).
+    When *agent_launched_url* is provided a PostToolUse(Agent) hook notifies the
+    control server when a background Agent tool call completes its launch turn
+    (the PostToolUse payload carries the agentId), and a SubagentStop hook
+    notifies the server when a subagent session ends.  Together these allow the
+    Stop hook to wait for all background agents to finish before signalling ACG
+    that a request is complete (fixes the premature-completion bug when Claude
+    uses ``Agent(run_in_background=True)``).
 
     *subagent_stop_url* is the URL for the SubagentStop hook endpoint.  When
-    omitted it is derived from *agent_started_url* by replacing ``/hook/agent-started``
-    with ``/hook/subagent-stop``; pass it explicitly to avoid that string surgery.
+    omitted it is derived from *agent_launched_url* by replacing
+    ``/hook/agent-launched`` with ``/hook/subagent-stop``; pass it explicitly
+    to avoid that string surgery.
     """
     hooks: dict = {}
     if include_pretool_hook:
@@ -130,7 +148,6 @@ def build_settings(
                             extra_allow_rules=extra_pretool_allow_rules,
                             extra_disallow_rules=extra_pretool_disallow_rules,
                             policy_file=policy_file,
-                            agent_started_url=agent_started_url,
                         ),
                     }
                 ],
@@ -146,19 +163,30 @@ def build_settings(
             ]
         }
     ]
-    if agent_started_url is not None:
+    if agent_launched_url is not None:
         if subagent_stop_url is None:
-            # Derive from agent_started_url as a convenience for callers that
-            # follow the /hook/agent-started convention.  Raise early rather than
+            # Derive from agent_launched_url as a convenience for callers that
+            # follow the /hook/agent-launched convention.  Raise early rather than
             # silently wiring the wrong endpoint (str.replace returns the original
             # string unchanged when the substring is absent).
-            if "/hook/agent-started" not in agent_started_url:
+            if "/hook/agent-launched" not in agent_launched_url:
                 raise ValueError(
-                    f"Cannot derive subagent_stop_url from {agent_started_url!r}: "
-                    "the URL must contain '/hook/agent-started', "
+                    f"Cannot derive subagent_stop_url from {agent_launched_url!r}: "
+                    "the URL must contain '/hook/agent-launched', "
                     "or pass subagent_stop_url explicitly."
                 )
-            subagent_stop_url = agent_started_url.replace("/hook/agent-started", "/hook/subagent-stop")
+            subagent_stop_url = agent_launched_url.replace("/hook/agent-launched", "/hook/subagent-stop")
+        hooks["PostToolUse"] = [
+            {
+                "matcher": "^Agent$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": posttool_hook_command(agent_launched_url),
+                    }
+                ],
+            }
+        ]
         hooks["SubagentStop"] = [
             {
                 "hooks": [
@@ -300,7 +328,7 @@ def write_merged_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
-    agent_started_url: str | None = None,
+    agent_launched_url: str | None = None,
     subagent_stop_url: str | None = None,
 ) -> GeneratedSettings:
     directory.mkdir(parents=True, exist_ok=True)
@@ -319,7 +347,7 @@ def write_merged_settings(
             extra_pretool_allow_rules=extra_pretool_allow_rules,
             extra_pretool_disallow_rules=extra_pretool_disallow_rules,
             policy_file=policy_file,
-            agent_started_url=agent_started_url,
+            agent_launched_url=agent_launched_url,
             subagent_stop_url=subagent_stop_url,
         ),
     )

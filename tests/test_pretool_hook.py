@@ -1,7 +1,5 @@
 import json
 from io import StringIO
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 
 from poor_claude.hooks import pretool_hook
 from poor_claude.hooks.pretool_hook import (
@@ -9,7 +7,6 @@ from poor_claude.hooks.pretool_hook import (
     _parse_rule,
     _read_policy_file,
     _tool_is_allowed,
-    _post_agent_started_best_effort,
 )
 
 
@@ -447,118 +444,3 @@ def test_pretool_hook_logs_raw_payload(tmp_path, monkeypatch) -> None:
     assert '"tool_name":"Skill"' in record["raw"]
 
 
-# ---------------------------------------------------------------------------
-# --agent-started-url: background Agent notification
-# ---------------------------------------------------------------------------
-
-
-def _start_capture_server():
-    """Start a minimal HTTP server that records POSTs and returns 200."""
-    received = []
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
-            received.append(json.loads(body))
-            self.send_response(200)
-            self.send_header("Content-Length", "2")
-            self.end_headers()
-            self.wfile.write(b"{}")
-
-        def log_message(self, *args):  # noqa: ANN002
-            pass
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, received
-
-
-def test_pretool_hook_posts_agent_started_when_bg_agent_allowed(monkeypatch) -> None:
-    server, received = _start_capture_server()
-    url = f"http://127.0.0.1:{server.server_address[1]}/hook/agent-started"
-    monkeypatch.setattr(
-        "poor_claude.hooks.pretool_hook._collect_allow_rules",
-        lambda cwd: ["Agent"],
-    )
-    monkeypatch.setattr(
-        "sys.stdin",
-        StringIO(
-            '{"tool_name":"Agent","tool_input":{"run_in_background":true},'
-            '"cwd":"/tmp","session_id":"test-session-id","permission_mode":"default"}'
-        ),
-    )
-    result = pretool_hook.main(["--agent-started-url", url])
-    assert result == 0
-    assert len(received) == 1
-    assert received[0]["session_id"] == "test-session-id"
-    assert received[0]["cwd"] == "/tmp"
-    server.shutdown()
-
-
-def test_pretool_hook_does_not_post_agent_started_when_bg_false(monkeypatch) -> None:
-    server, received = _start_capture_server()
-    url = f"http://127.0.0.1:{server.server_address[1]}/hook/agent-started"
-    monkeypatch.setattr(
-        "poor_claude.hooks.pretool_hook._collect_allow_rules",
-        lambda cwd: ["Agent"],
-    )
-    monkeypatch.setattr(
-        "sys.stdin",
-        StringIO(
-            '{"tool_name":"Agent","tool_input":{"run_in_background":false},'
-            '"cwd":"/tmp","session_id":"test-session-id","permission_mode":"default"}'
-        ),
-    )
-    result = pretool_hook.main(["--agent-started-url", url])
-    assert result == 0
-    assert received == []
-    server.shutdown()
-
-
-def test_pretool_hook_does_not_post_agent_started_when_denied(monkeypatch) -> None:
-    server, received = _start_capture_server()
-    url = f"http://127.0.0.1:{server.server_address[1]}/hook/agent-started"
-    # No allow rules → Agent call is denied
-    monkeypatch.setattr(
-        "poor_claude.hooks.pretool_hook._collect_allow_rules",
-        lambda cwd: [],
-    )
-    monkeypatch.setattr(
-        "sys.stdin",
-        StringIO(
-            '{"tool_name":"Agent","tool_input":{"run_in_background":true},'
-            '"cwd":"/tmp","session_id":"test-session-id","permission_mode":"default"}'
-        ),
-    )
-    result = pretool_hook.main(["--agent-started-url", url])
-    assert result == 2
-    assert received == []
-    server.shutdown()
-
-
-def test_pretool_hook_posts_agent_started_in_non_default_mode(monkeypatch) -> None:
-    server, received = _start_capture_server()
-    url = f"http://127.0.0.1:{server.server_address[1]}/hook/agent-started"
-    monkeypatch.setattr(
-        "sys.stdin",
-        StringIO(
-            '{"tool_name":"Agent","tool_input":{"run_in_background":true},'
-            '"cwd":"/tmp","session_id":"sess-auto","permission_mode":"auto"}'
-        ),
-    )
-    result = pretool_hook.main(["--agent-started-url", url])
-    assert result == 0
-    assert len(received) == 1
-    assert received[0]["session_id"] == "sess-auto"
-    server.shutdown()
-
-
-def test_post_agent_started_best_effort_swallows_connection_error(capsys) -> None:
-    # Should not raise even if the server is unreachable, but must log to stderr
-    # so operators can diagnose lost increments (a missed increment causes the
-    # same premature-completion symptom the feature is meant to fix).
-    _post_agent_started_best_effort("http://127.0.0.1:1/hook/agent-started", "sid", "/cwd")
-    captured = capsys.readouterr()
-    assert "agent-started notification failed" in captured.err

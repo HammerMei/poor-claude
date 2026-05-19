@@ -9,7 +9,6 @@ import os
 import re
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 
@@ -137,30 +136,6 @@ def _read_policy_file(path: str) -> tuple[list[str], list[str]]:
     return [], []
 
 
-def _post_agent_started_best_effort(url: str, session_id: str, cwd: str) -> None:
-    """Best-effort POST to /hook/agent-started; swallows all errors.
-
-    Called when the pretool hook sees a background Agent tool call that it is
-    about to allow, so the control server can increment its background-agent
-    counter before the first (premature) Stop hook fires.
-    """
-    try:
-        body = json.dumps({"session_id": session_id, "cwd": cwd}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=2) as response:  # noqa: S310
-            response.read()
-    except Exception as exc:  # noqa: BLE001
-        # Log to stderr so operators can diagnose lost increments (a missed
-        # increment means the Stop hook won't defer and will complete early —
-        # the same symptom as the bug this feature fixes).
-        print(f"poor-claude: agent-started notification failed: {exc}", file=sys.stderr)
-        # Never block the tool call regardless.
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
@@ -172,8 +147,6 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="RULE", help="Static disallow rule baked in at launch (takes priority over allow)")
     parser.add_argument("--policy-file", metavar="PATH",
                         help="Path to a JSON policy file with allow/disallow rules; read fresh on every invocation")
-    parser.add_argument("--agent-started-url", metavar="URL",
-                        help="URL to POST when a background Agent tool call is allowed; best-effort, never blocks")
     args = parser.parse_args(argv)
     raw = sys.stdin.read() or "{}"
     _append_log(args.log_path, raw)
@@ -199,12 +172,6 @@ def main(argv: list[str] | None = None) -> int:
     # Only in "default" mode does Claude show an interactive dialog that would
     # block forever in a headless session — that's where we must step in.
     if permission_mode != "default":
-        if (
-            args.agent_started_url
-            and tool_name == "Agent"
-            and tool_input.get("run_in_background") is True
-        ):
-            _post_agent_started_best_effort(args.agent_started_url, session_id, cwd)
         return 0
 
     # Collect rules from all sources.
@@ -224,12 +191,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if _tool_is_allowed(tool_name, tool_input, allow_rules):
-        if (
-            args.agent_started_url
-            and tool_name == "Agent"
-            and tool_input.get("run_in_background") is True
-        ):
-            _post_agent_started_best_effort(args.agent_started_url, session_id, cwd)
         return 0  # matches allow list: defer to Claude's own check
 
     # Not in allow list: deny immediately to prevent blocking on a permission dialog

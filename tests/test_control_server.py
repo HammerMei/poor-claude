@@ -1436,14 +1436,14 @@ def test_control_server_can_launch_and_stop_managed_process(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background-agent counter: /hook/agent-started, /hook/subagent-stop,
+# Background-agent tracking: /hook/agent-launched, /hook/subagent-stop,
 # and the gated Stop hook
 # ---------------------------------------------------------------------------
 
 
 def test_stop_hook_defers_when_background_agents_pending(tmp_path) -> None:
     """Stop hook returns deferred=True and does NOT complete the request while
-    pending_background_agents > 0."""
+    pending_background_agent_ids is non-empty."""
     server, address = start_test_server()
     try:
         queued = request_json(
@@ -1458,14 +1458,14 @@ def test_stop_hook_defers_when_background_agents_pending(tmp_path) -> None:
         )
         session_id = queued["session_id"]
 
-        # Simulate PreToolUse(Agent, bg=True) being allowed
-        agent_started = request_json(
+        # Simulate PostToolUse(Agent, isAsync=true) delivering agentId
+        agent_launched = request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
-        assert agent_started["ok"] is True
-        assert agent_started["pending"] == 1
+        assert agent_launched["ok"] is True
+        assert agent_launched["pending"] == 1
 
         # First (premature) Stop fires — should be deferred
         stop_response = request_json(
@@ -1483,11 +1483,11 @@ def test_stop_hook_defers_when_background_agents_pending(tmp_path) -> None:
         listed = request_json("GET", f"{address}/sessions")
         assert listed["sessions"][0]["active_request"] == queued["request_id"]
 
-        # Background agent finishes
+        # Background agent finishes — SubagentStop carries the same agentId
         subagent_stop = request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         assert subagent_stop["ok"] is True
         assert subagent_stop["pending"] == 0
@@ -1545,7 +1545,8 @@ def test_stop_hook_completes_immediately_when_no_background_agents(tmp_path) -> 
         server.server_close()
 
 
-def test_agent_started_increments_counter(tmp_path) -> None:
+def test_agent_launched_tracks_agent_ids(tmp_path) -> None:
+    """Two distinct background agents are each tracked by agentId."""
     server, address = start_test_server()
     try:
         request_json(
@@ -1560,15 +1561,15 @@ def test_agent_started_increments_counter(tmp_path) -> None:
         )
         r1 = request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         assert r1["pending"] == 1
 
         r2 = request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-002"},
         )
         assert r2["pending"] == 2
     finally:
@@ -1576,7 +1577,8 @@ def test_agent_started_increments_counter(tmp_path) -> None:
         server.server_close()
 
 
-def test_subagent_stop_decrements_counter(tmp_path) -> None:
+def test_subagent_stop_discards_agent_id(tmp_path) -> None:
+    """SubagentStop with the matching agentId removes it from the tracking set."""
     server, address = start_test_server()
     try:
         request_json(
@@ -1591,13 +1593,13 @@ def test_subagent_stop_decrements_counter(tmp_path) -> None:
         )
         request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         r = request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         assert r["pending"] == 0
     finally:
@@ -1605,8 +1607,8 @@ def test_subagent_stop_decrements_counter(tmp_path) -> None:
         server.server_close()
 
 
-def test_subagent_stop_clamps_at_zero(tmp_path) -> None:
-    """Extra SubagentStop calls (e.g. from sync agents) don't drive counter negative."""
+def test_subagent_stop_for_unknown_agent_id_is_noop(tmp_path) -> None:
+    """SubagentStop for an unknown agentId is a safe no-op — the known agent stays tracked."""
     server, address = start_test_server()
     try:
         request_json(
@@ -1619,16 +1621,33 @@ def test_subagent_stop_clamps_at_zero(tmp_path) -> None:
                 "workdir": str(tmp_path),
             },
         )
-        # No agent-started, so counter starts at 0
+        session_id = request_json("GET", f"{address}/sessions")["sessions"][0]["session_id"]
+
+        # Register agent-A
+        request_json(
+            "POST",
+            f"{address}/hook/agent-launched",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-A"},
+        )
+
+        # SubagentStop for agent-B (unknown) — must be a no-op
         r = request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-B"},
         )
-        assert r["pending"] == 0
+        assert r["pending"] == 1  # agent-A is still tracked
 
-        # Subsequent Stop should complete normally (counter is 0)
-        session_id = request_json("GET", f"{address}/sessions")["sessions"][0]["session_id"]
+        # The request must still be active (Stop hook would defer)
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is not None
+
+        # Clean up: remove agent-A, then complete
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-A"},
+        )
         stop_r = request_json(
             "POST",
             f"{address}/hook/stop",
@@ -1640,11 +1659,11 @@ def test_subagent_stop_clamps_at_zero(tmp_path) -> None:
         server.server_close()
 
 
-def test_counter_resets_on_new_request(tmp_path) -> None:
-    """pending_background_agents resets to 0 at the start of each new request."""
+def test_pending_set_resets_on_new_request(tmp_path) -> None:
+    """pending_background_agent_ids is cleared at the start of each new request."""
     server, address = start_test_server()
     try:
-        # Start first request, increment counter, complete via SubagentStop + Stop
+        # Start first request, track one agent, complete via SubagentStop + Stop
         request_json(
             "POST",
             f"{address}/requests",
@@ -1657,13 +1676,13 @@ def test_counter_resets_on_new_request(tmp_path) -> None:
         )
         request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": "demo", "cwd": str(tmp_path)},
+            {"session_id": "demo", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         request_json(
             "POST",
@@ -1671,7 +1690,7 @@ def test_counter_resets_on_new_request(tmp_path) -> None:
             {"session_id": "demo", "response": "r1 done", "cwd": str(tmp_path)},
         )
 
-        # Start second request — counter must be reset to 0
+        # Start second request — pending set must be reset to empty
         request_json(
             "POST",
             f"{address}/requests",
@@ -1694,13 +1713,13 @@ def test_counter_resets_on_new_request(tmp_path) -> None:
         server.server_close()
 
 
-def test_agent_started_returns_no_session_when_session_not_found(tmp_path) -> None:
+def test_agent_launched_returns_no_session_when_session_not_found(tmp_path) -> None:
     server, address = start_test_server()
     try:
         r = request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": "nonexistent-session-id", "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": "nonexistent-session-id", "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         assert r.get("no_session") is True
     finally:
@@ -1757,11 +1776,11 @@ def test_transcript_path_defers_when_background_agents_pending(tmp_path, monkeyp
         )
         session_id = q["session_id"]
 
-        # Bump counter before the transcript path fires
+        # Track a background agent before the transcript path fires
         request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
 
         # Give the transcript poller a moment to observe end_turn but not complete
@@ -1778,7 +1797,7 @@ def test_transcript_path_defers_when_background_agents_pending(tmp_path, monkeyp
         request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
         request_json(
             "POST",
@@ -1827,22 +1846,22 @@ def test_transcript_path_does_not_complete_immediately_after_subagent_stop(tmp_p
         )
         session_id = q["session_id"]
 
-        # Increment counter so the first transcript-path fire defers.
+        # Track a background agent so the first transcript-path fire defers.
         request_json(
             "POST",
-            f"{address}/hook/agent-started",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            f"{address}/hook/agent-launched",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
 
         # Wait long enough for the transcript path to fire (>0.5s quiet period)
         # and then defer (clearing stable values).
         time.sleep(1.2)
 
-        # Now fire SubagentStop: counter drops to 0.
+        # Now fire SubagentStop with the matching agentId: set empties.
         request_json(
             "POST",
             f"{address}/hook/subagent-stop",
-            {"session_id": session_id, "cwd": str(tmp_path)},
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "agent-001"},
         )
 
         # Immediately after counter drops to 0 the request should still be

@@ -199,8 +199,8 @@ def prepare_launch_spec(
         base_settings_path_or_json=session.metadata.get("settings_path") or None,
         include_pretool_hook=include_pretool_hook,
         policy_file=policy_file,
-        agent_started_url=f"{base_url}/hook/agent-started" if include_pretool_hook else None,
-        subagent_stop_url=f"{base_url}/hook/subagent-stop" if include_pretool_hook else None,
+        agent_launched_url=f"{base_url}/hook/agent-launched",
+        subagent_stop_url=f"{base_url}/hook/subagent-stop",
     )
     mcp_log_path = route_dir / "mcp-stdio.log"
     stdout_path = route_dir / "claude.stdout.log"

@@ -39,10 +39,13 @@ class SessionRecord:
     active_request: PendingRequest | None = None
     completed_request_ids: deque[str] = field(default_factory=lambda: deque(maxlen=256))
     metadata: dict[str, str] = field(default_factory=dict)
-    # Tracks background Agent tool calls that have started but whose SubagentStop
-    # hook has not yet fired.  The Stop hook is deferred until this counter reaches
-    # zero so we wait for all background agents to finish before signalling ACG.
-    pending_background_agents: int = 0
+    # Tracks background Agent tool calls by agentId.  Populated by the PostToolUse
+    # hook when it sees a background Agent response (isAsync: true).  Each entry is
+    # removed when the matching SubagentStop fires.  The Stop hook is deferred until
+    # this set is empty so we wait for all background agents to finish before
+    # signalling ACG.  Set semantics make stale SubagentStop calls (e.g. from sync
+    # agents) safe no-ops via discard().
+    pending_background_agent_ids: set = field(default_factory=set)
 
     def is_idle_expired(self, now: float | None = None) -> bool:
         if self.keep_alive or self.ttl_seconds is None or self.active_request is not None:
@@ -123,7 +126,7 @@ class SessionRegistry:
             timeout_seconds=timeout_seconds,
         )
         record.active_request = request
-        record.pending_background_agents = 0
+        record.pending_background_agent_ids = set()
         return request
 
     def finish_request(

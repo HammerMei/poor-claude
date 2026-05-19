@@ -22,9 +22,12 @@ def main(argv: list[str] | None = None) -> int:
             # or an unexpected payload. Nothing to notify.
             return 0
         cwd = data.get("cwd")
-        body = json.dumps(
-            {"session_id": session_id, "cwd": cwd if isinstance(cwd, str) else None}
-        ).encode("utf-8")
+        agent_id = data.get("agent_id")
+        body = json.dumps({
+            "session_id": session_id,
+            "cwd": cwd if isinstance(cwd, str) else None,
+            "agent_id": agent_id if isinstance(agent_id, str) else None,
+        }).encode("utf-8")
         request = urllib.request.Request(
             args.callback_url,
             data=body,

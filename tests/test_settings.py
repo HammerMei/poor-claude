@@ -7,6 +7,7 @@ from poor_claude.settings import (
     cleanup_project_local_settings,
     ensure_skip_dangerous_mode_prompt,
     merge_settings,
+    posttool_hook_command,
     read_settings,
     strip_poor_claude_managed_settings,
     stop_hook_command,
@@ -37,6 +38,8 @@ def test_build_settings_contains_stop_hook_only() -> None:
     assert "--poor-claude-managed" in settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert hook["type"] == "command"
     assert "poor_claude.hooks.stop_hook" in hook["command"]
+    # No PostToolUse hook when agent_launched_url is not provided
+    assert "PostToolUse" not in settings["hooks"]
 
 
 def test_build_settings_omits_pretool_hook_when_not_requested() -> None:
@@ -242,6 +245,15 @@ def test_ensure_skip_dangerous_mode_prompt_is_noop_when_already_set(tmp_path) ->
     assert json.loads(path.read_text(encoding="utf-8")) == original
 
 
+def test_posttool_hook_command_uses_local_module() -> None:
+    command = posttool_hook_command("http://127.0.0.1:1234/hook/agent-launched")
+    assert sys.executable in command
+    assert "-m poor_claude.hooks.posttool_hook" in command
+    assert "--poor-claude-managed" in command
+    assert "PYTHONPATH=" in command
+    assert "http://127.0.0.1:1234/hook/agent-launched" in command
+
+
 def test_subagent_stop_hook_command_uses_local_module() -> None:
     command = subagent_stop_hook_command("http://127.0.0.1:1234/hook/subagent-stop")
     assert sys.executable in command
@@ -251,18 +263,29 @@ def test_subagent_stop_hook_command_uses_local_module() -> None:
     assert "http://127.0.0.1:1234/hook/subagent-stop" in command
 
 
-def test_build_settings_without_agent_started_url_has_no_subagent_stop_hook() -> None:
+def test_build_settings_without_agent_launched_url_has_no_posttool_or_subagent_hooks() -> None:
     settings = build_settings("http://127.0.0.1:1234/hook/stop")
     assert "SubagentStop" not in settings["hooks"]
+    assert "PostToolUse" not in settings["hooks"]
     pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert "--agent-started-url" not in pretool_cmd
+    assert "--callback-url" not in pretool_cmd or "posttool" not in pretool_cmd
 
 
-def test_build_settings_with_agent_started_url_adds_subagent_stop_hook() -> None:
+def test_build_settings_with_agent_launched_url_adds_posttool_and_subagent_stop_hooks() -> None:
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
-        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
     )
+    # PostToolUse hook with Agent-only matcher
+    assert "PostToolUse" in settings["hooks"]
+    posttool_entry = settings["hooks"]["PostToolUse"][0]
+    assert posttool_entry["matcher"] == "^Agent$"
+    posttool_hook = posttool_entry["hooks"][0]
+    assert posttool_hook["type"] == "command"
+    assert "poor_claude.hooks.posttool_hook" in posttool_hook["command"]
+    assert "http://127.0.0.1:1234/hook/agent-launched" in posttool_hook["command"]
+    # SubagentStop hook
     assert "SubagentStop" in settings["hooks"]
     subagent_hook = settings["hooks"]["SubagentStop"][0]["hooks"][0]
     assert subagent_hook["type"] == "command"
@@ -270,52 +293,54 @@ def test_build_settings_with_agent_started_url_adds_subagent_stop_hook() -> None
     assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook["command"]
 
 
-def test_build_settings_with_agent_started_url_adds_flag_to_pretool_hook() -> None:
+def test_build_settings_with_agent_launched_url_does_not_add_flag_to_pretool_hook() -> None:
+    """PreToolUse hook no longer carries agent-started notification logic."""
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
-        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
     )
     pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert "--agent-started-url" in pretool_cmd
-    assert "http://127.0.0.1:1234/hook/agent-started" in pretool_cmd
+    assert "--agent-started-url" not in pretool_cmd
+    assert "agent-launched" not in pretool_cmd
 
 
-def test_build_settings_with_agent_started_url_keeps_subagent_stop_hook_when_pretool_excluded() -> None:
-    # SubagentStop must still be registered even when the pretool hook is
-    # disabled (bypassPermissions mode): background agents can still run, and
-    # the control server still needs the decrement signal.
+def test_build_settings_with_agent_launched_url_keeps_hooks_when_pretool_excluded() -> None:
+    # Both PostToolUse(Agent) and SubagentStop must still be registered even when
+    # the pretool hook is disabled (bypassPermissions mode): background agents can
+    # still run and the control server still needs both signals.
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
         include_pretool_hook=False,
-        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
     )
     assert "SubagentStop" in settings["hooks"]
+    assert "PostToolUse" in settings["hooks"]
     assert "PreToolUse" not in settings["hooks"]
 
 
 def test_build_settings_accepts_explicit_subagent_stop_url() -> None:
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
-        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
         subagent_stop_url="http://127.0.0.1:1234/hook/subagent-stop",
     )
     subagent_hook_cmd = settings["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
     assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook_cmd
 
 
-def test_build_settings_raises_when_agent_started_url_cannot_be_derived() -> None:
+def test_build_settings_raises_when_agent_launched_url_cannot_be_derived() -> None:
     import pytest
     with pytest.raises(ValueError, match="subagent_stop_url"):
         build_settings(
             "http://127.0.0.1:1234/hook/stop",
-            agent_started_url="http://127.0.0.1:1234/hook/notify",  # missing /hook/agent-started
+            agent_launched_url="http://127.0.0.1:1234/hook/notify",  # missing /hook/agent-launched
         )
 
 
-def test_strip_poor_claude_managed_settings_removes_subagent_stop_hook() -> None:
+def test_strip_poor_claude_managed_settings_removes_posttool_and_subagent_stop_hooks() -> None:
     settings = build_settings(
         "http://127.0.0.1:1234/hook/stop",
-        agent_started_url="http://127.0.0.1:1234/hook/agent-started",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
     )
     stripped = strip_poor_claude_managed_settings(settings)
     assert stripped == {}

@@ -351,7 +351,7 @@ def test_ensure_workspace_trust_creates_entry_when_none_exists(tmp_path) -> None
     path = tmp_path / "settings.json"
     ensure_workspace_trust(tmp_path, path)
     import os
-    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["projects"][key]["hasTrustDialogAccepted"] is True
 
@@ -362,7 +362,7 @@ def test_ensure_workspace_trust_adds_to_existing_projects(tmp_path) -> None:
     path.write_text(json.dumps({"projects": {other_key: {"hasTrustDialogAccepted": True}}}), encoding="utf-8")
     ensure_workspace_trust(tmp_path, path)
     import os
-    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["projects"][other_key]["hasTrustDialogAccepted"] is True
     assert data["projects"][key]["hasTrustDialogAccepted"] is True
@@ -371,7 +371,7 @@ def test_ensure_workspace_trust_adds_to_existing_projects(tmp_path) -> None:
 def test_ensure_workspace_trust_is_noop_when_already_set(tmp_path) -> None:
     import os
     path = tmp_path / "settings.json"
-    key = os.path.normpath(os.path.abspath(str(tmp_path)))
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
     original = {"projects": {key: {"hasTrustDialogAccepted": True, "otherKey": "preserved"}}}
     path.write_text(json.dumps(original), encoding="utf-8")
     mtime_before = path.stat().st_mtime_ns

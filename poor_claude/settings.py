@@ -423,9 +423,12 @@ def ensure_workspace_trust(workdir: Path, global_settings_path: Path | None = No
     would silently fail on symlinked workdirs.
     """
     path = global_settings_path or Path.home() / ".claude" / "settings.json"
-    # Compute the project key the same way Claude Code does in k58(path.resolve(q)):
-    # normalize + make absolute, no symlink resolution.
-    key = os.path.normpath(os.path.abspath(str(workdir)))
+    # Compute the project key the same way Claude Code does.  Claude Code writes the
+    # key using process.cwd() (run inside the workdir), which returns the real
+    # (symlink-resolved) path on macOS — e.g. /private/tmp/foo even if the caller
+    # passed /tmp/foo.  os.path.realpath follows symlinks to match that behaviour;
+    # os.path.abspath would not and would produce a mismatched key on macOS.
+    key = os.path.normpath(os.path.realpath(str(workdir)))
     data: dict = {}
     if path.exists():
         try:

@@ -11,6 +11,17 @@ from pathlib import Path
 SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 MAX_TRANSCRIPT_READ_BYTES = 1024 * 1024  # fallback when no offset is known
 _BACKGROUND_AGENT_ID_RE = re.compile(r"agentId:\s+([A-Za-z0-9_-]+)")
+# Matches the task-runner notification emitted when Bash(run_in_background=True) launches.
+_BACKGROUND_TASK_ID_RE = re.compile(r"Command running in background with ID:\s+([a-z0-9]+)\.")
+# Step 1: extract an entire <task-notification> block.
+_TASK_NOTIFICATION_BLOCK_RE = re.compile(r"<task-notification>.*?</task-notification>", re.DOTALL)
+# Step 2: extract task-id / status from inside a single block (no cross-block leakage).
+_TASK_ID_IN_BLOCK_RE = re.compile(r"<task-id>([^<]+)</task-id>")
+# Terminal statuses observed in practice: completed, killed, failed, stopped.
+# The only known non-terminal status is "running".  We keep an explicit whitelist
+# (rather than "anything not running") so that a future unknown status is ignored
+# rather than silently treated as terminal — failing loudly is safer here.
+_TASK_STATUS_TERMINAL_RE = re.compile(r"<status>(completed|killed|failed|stopped)</status>")
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,109 @@ def find_background_agent_ids_in_transcript(
                         if aid not in agent_ids:
                             agent_ids.append(aid)
     return agent_ids
+
+
+def find_background_task_ids_in_transcript(
+    path: Path, *, request_id: str, start_offset: int = 0
+) -> list[str]:
+    """Return task IDs of ``Bash(run_in_background=True)`` launches during *request_id*.
+
+    Scans tool_result content blocks appearing after the
+    ``<poor-claude-request id="...">`` marker for
+    "Command running in background with ID: {task_id}." messages emitted by the
+    Claude Code task runner when a shell command is launched asynchronously.
+
+    *start_offset* works the same as in :func:`find_background_agent_ids_in_transcript`.
+    """
+    if not path.exists():
+        return []
+    seen_request = False
+    task_ids: list[str] = []
+    try:
+        if start_offset > 0:
+            lines = _read_from_offset(path, start_offset=start_offset).splitlines()
+        else:
+            lines = _read_recent_text(path, max_bytes=MAX_TRANSCRIPT_READ_BYTES).splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "user":
+            user_text = _content_to_text(content)
+            if f'<poor-claude-request id="{request_id}">' in user_text:
+                seen_request = True
+            if not seen_request:
+                continue
+            for text in _tool_result_texts(content):
+                for match in _BACKGROUND_TASK_ID_RE.finditer(text):
+                    tid = match.group(1)
+                    if tid not in task_ids:
+                        task_ids.append(tid)
+    return task_ids
+
+
+def find_completed_task_ids_in_transcript(
+    path: Path, *, request_id: str, start_offset: int = 0
+) -> list[str]:
+    """Return task IDs of Bash background tasks that reached a terminal status during *request_id*.
+
+    Scans user messages after the ``<poor-claude-request id="...">`` marker for
+    ``<task-notification>`` blocks whose ``<status>`` is one of the terminal values:
+    ``completed``, ``killed``, ``failed``, or ``stopped``.
+
+    Unlike agent tracking (which relies on the ``SubagentStop`` hook), Bash task
+    completion is detected entirely from the transcript so callers must call this
+    function to discover when tasks finish and remove them from the pending set.
+
+    *start_offset* works the same as in :func:`find_background_agent_ids_in_transcript`.
+    """
+    if not path.exists():
+        return []
+    seen_request = False
+    task_ids: list[str] = []
+    try:
+        if start_offset > 0:
+            lines = _read_from_offset(path, start_offset=start_offset).splitlines()
+        else:
+            lines = _read_recent_text(path, max_bytes=MAX_TRANSCRIPT_READ_BYTES).splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        text = _content_to_text(message.get("content"))
+        if not seen_request:
+            if f'<poor-claude-request id="{request_id}">' in text:
+                seen_request = True
+            if not seen_request:
+                continue
+        for block in _TASK_NOTIFICATION_BLOCK_RE.finditer(text):
+            block_text = block.group(0)
+            id_match = _TASK_ID_IN_BLOCK_RE.search(block_text)
+            if id_match and _TASK_STATUS_TERMINAL_RE.search(block_text):
+                tid = id_match.group(1).strip()
+                if tid not in task_ids:
+                    task_ids.append(tid)
+    return task_ids
 
 
 def _tool_result_texts(content: object) -> list[str]:

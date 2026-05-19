@@ -22,7 +22,13 @@ from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
 from poor_claude.settings import cleanup_project_local_settings
 from poor_claude.session import SessionRegistry
-from poor_claude.transcript import find_background_agent_ids_in_transcript, read_response_record_after_request_from_file, transcript_candidates
+from poor_claude.transcript import (
+    find_background_agent_ids_in_transcript,
+    find_background_task_ids_in_transcript,
+    find_completed_task_ids_in_transcript,
+    read_response_record_after_request_from_file,
+    transcript_candidates,
+)
 
 
 class ControlState:
@@ -430,32 +436,53 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
             else:
                 transcript_fallback_response = transcript_response
                 if transcript_stop_reason == "end_turn":
-                    # Scan the transcript for background agents not registered via
-                    # PostToolUse (PostToolUse doesn't fire in bypassPermissions mode).
+                    # Scan the transcript for background agents/tasks not registered via
+                    # hooks (PostToolUse doesn't fire in bypassPermissions mode; Bash tasks
+                    # have no SubagentStop equivalent).
                     # Only scan once per stable-response window to avoid repeated I/O.
                     if not transcript_bg_agents_scanned:
                         transcript_bg_agents_scanned = True
                         newly_discovered: list[str] = []
+                        newly_discovered_tasks: list[str] = []
+                        completed_tasks: list[str] = []
                         for candidate in candidates:
-                            found = find_background_agent_ids_in_transcript(
+                            found_agents = find_background_agent_ids_in_transcript(
                                 candidate,
                                 request_id=request.request_id,
                                 start_offset=transcript_offsets.get(str(candidate), 0),
                             )
-                            if found:
-                                newly_discovered = found
+                            found_tasks = find_background_task_ids_in_transcript(
+                                candidate,
+                                request_id=request.request_id,
+                                start_offset=transcript_offsets.get(str(candidate), 0),
+                            )
+                            found_completed = find_completed_task_ids_in_transcript(
+                                candidate,
+                                request_id=request.request_id,
+                                start_offset=transcript_offsets.get(str(candidate), 0),
+                            )
+                            if found_agents or found_tasks or found_completed:
+                                newly_discovered = found_agents
+                                newly_discovered_tasks = found_tasks
+                                completed_tasks = found_completed
                                 break
                     else:
                         newly_discovered = []
+                        newly_discovered_tasks = []
+                        completed_tasks = []
                     with state.lock:
                         if state.registry._sessions.get(session.route_key) is not session:
                             raise RuntimeError("session route no longer exists")
-                        # Register newly discovered background agents that haven't
-                        # already completed (SubagentStop may fire before we scan).
+                        # Register newly discovered background agents (SubagentStop may
+                        # fire before we scan, so guard against re-adding completed ones).
                         for aid in newly_discovered:
                             if aid not in session.completed_agent_ids and aid not in session.pending_background_agent_ids:
                                 session.pending_background_agent_ids.add(aid)
-                        if newly_discovered:
+                        # Register newly discovered Bash background tasks.
+                        for tid in newly_discovered_tasks:
+                            if tid not in session.completed_agent_ids and tid not in session.pending_background_agent_ids:
+                                session.pending_background_agent_ids.add(tid)
+                        if newly_discovered or newly_discovered_tasks:
                             bg_agent_detected = True
                             # First-one-wins: store the premature transcript
                             # response as the intermediate output so it can be
@@ -463,6 +490,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             # the Stop hook path having already set this.
                             if request.intermediate_response is None and stable_transcript_response:
                                 request.intermediate_response = stable_transcript_response
+                        # Remove Bash tasks that reached a terminal state.  Unlike agent
+                        # tasks (cleared by SubagentStop), completion is transcript-only.
+                        for tid in completed_tasks:
+                            session.completed_agent_ids.add(tid)
+                            session.pending_background_agent_ids.discard(tid)
                         if len(session.pending_background_agent_ids) > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
@@ -854,9 +886,17 @@ def make_handler(state: ControlState):
                 # during file I/O, and BEFORE the completed_request_ids check so we
                 # can populate pending_background_agent_ids even on the first Stop.
                 discovered_agents: list[str] = []
+                discovered_tasks: list[str] = []
+                completed_tasks: list[str] = []
                 if isinstance(transcript_path_str, str) and isinstance(request_id, str):
                     try:
                         discovered_agents = find_background_agent_ids_in_transcript(
+                            Path(transcript_path_str), request_id=request_id
+                        )
+                        discovered_tasks = find_background_task_ids_in_transcript(
+                            Path(transcript_path_str), request_id=request_id
+                        )
+                        completed_tasks = find_completed_task_ids_in_transcript(
                             Path(transcript_path_str), request_id=request_id
                         )
                     except Exception:  # noqa: BLE001
@@ -886,6 +926,17 @@ def make_handler(state: ControlState):
                     for aid in discovered_agents:
                         if aid not in session.completed_agent_ids and aid not in session.pending_background_agent_ids:
                             session.pending_background_agent_ids.add(aid)
+                    # Register newly discovered Bash background tasks.
+                    for tid in discovered_tasks:
+                        if tid not in session.completed_agent_ids and tid not in session.pending_background_agent_ids:
+                            session.pending_background_agent_ids.add(tid)
+                    # Remove Bash tasks that have reached a terminal state
+                    # (completed, killed, failed, stopped).  Unlike agent tasks,
+                    # there is no SubagentStop hook — completion is detected
+                    # entirely from the transcript.
+                    for tid in completed_tasks:
+                        session.completed_agent_ids.add(tid)
+                        session.pending_background_agent_ids.discard(tid)
                     if len(session.pending_background_agent_ids) > 0:
                         # Background agents are still running.  Defer completion
                         # until SubagentStop fires for each of them and the set

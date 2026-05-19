@@ -24,6 +24,11 @@ class PendingRequest:
     created_at: float
     timeout_seconds: int
     response: str | None = None
+    # First Claude turn before background agents complete (e.g. "LAUNCHED").
+    # Set once (first-one-wins) by either _handle_stop_hook (when it defers) or
+    # _wait_for_response (when it detects a background agent in the transcript).
+    # Prepended to the final response so callers see the full turn history.
+    intermediate_response: str | None = None
 
 
 @dataclass
@@ -39,6 +44,25 @@ class SessionRecord:
     active_request: PendingRequest | None = None
     completed_request_ids: deque[str] = field(default_factory=lambda: deque(maxlen=256))
     metadata: dict[str, str] = field(default_factory=dict)
+    # Tracks background Agent tool calls that are still running.
+    #
+    # Previously populated by the PostToolUse hook (which does not fire in
+    # bypassPermissions mode).  Now populated by the Stop hook handler and the
+    # transcript-polling loop via ``find_background_agent_ids_in_transcript`` —
+    # they scan the session transcript for "Async agent launched successfully"
+    # tool results and add newly discovered agentIds here.  Each entry is removed
+    # when the matching SubagentStop fires.  The Stop hook is deferred until this
+    # set is empty so we wait for all background agents to finish before signalling
+    # ACG.  Set semantics make stale SubagentStop calls (e.g. from sync agents)
+    # safe no-ops via discard().
+    pending_background_agent_ids: set = field(default_factory=set)
+    # Accumulates agentIds of background agents that have *completed* (SubagentStop
+    # fired) during the current request.  Used by the transcript-scan logic to avoid
+    # re-adding agents that already finished before we discovered them in the
+    # transcript — a SubagentStop that fires before the scan would otherwise cause
+    # an infinite defer loop.  Reset at the start of each new request alongside
+    # pending_background_agent_ids.
+    completed_agent_ids: set = field(default_factory=set)
 
     def is_idle_expired(self, now: float | None = None) -> bool:
         if self.keep_alive or self.ttl_seconds is None or self.active_request is not None:
@@ -119,6 +143,8 @@ class SessionRegistry:
             timeout_seconds=timeout_seconds,
         )
         record.active_request = request
+        record.pending_background_agent_ids = set()
+        record.completed_agent_ids = set()
         return request
 
     def finish_request(

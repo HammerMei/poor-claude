@@ -41,6 +41,44 @@ def stop_hook_command(callback_url: str) -> str:
     )
 
 
+def subagent_stop_hook_command(callback_url: str) -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(project_root)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    return " ".join(
+        [
+            f"PYTHONPATH={shlex.quote(pythonpath)}",
+            shlex.quote(sys.executable),
+            "-m",
+            "poor_claude.hooks.subagent_stop_hook",
+            "--poor-claude-managed",
+            "--callback-url",
+            shlex.quote(callback_url),
+        ]
+    )
+
+
+def posttool_hook_command(callback_url: str) -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(project_root)
+    if existing_pythonpath:
+        pythonpath = f"{pythonpath}{os.pathsep}{existing_pythonpath}"
+    return " ".join(
+        [
+            f"PYTHONPATH={shlex.quote(pythonpath)}",
+            shlex.quote(sys.executable),
+            "-m",
+            "poor_claude.hooks.posttool_hook",
+            "--poor-claude-managed",
+            "--callback-url",
+            shlex.quote(callback_url),
+        ]
+    )
+
+
 def pretool_hook_command(
     log_path: Path | None = None,
     extra_allow_rules: list[str] | None = None,
@@ -78,8 +116,24 @@ def build_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
+    agent_launched_url: str | None = None,
+    subagent_stop_url: str | None = None,
 ) -> dict:
-    """Build settings that are passed via `claude --settings <local-file>`."""
+    """Build settings that are passed via `claude --settings <local-file>`.
+
+    When *agent_launched_url* is provided a PostToolUse(Agent) hook notifies the
+    control server when a background Agent tool call completes its launch turn
+    (the PostToolUse payload carries the agentId), and a SubagentStop hook
+    notifies the server when a subagent session ends.  Together these allow the
+    Stop hook to wait for all background agents to finish before signalling ACG
+    that a request is complete (fixes the premature-completion bug when Claude
+    uses ``Agent(run_in_background=True)``).
+
+    *subagent_stop_url* is the URL for the SubagentStop hook endpoint.  When
+    omitted it is derived from *agent_launched_url* by replacing
+    ``/hook/agent-launched`` with ``/hook/subagent-stop``; pass it explicitly
+    to avoid that string surgery.
+    """
     hooks: dict = {}
     if include_pretool_hook:
         log_path = permission_log_path.parent / "pretool-hook.log" if permission_log_path is not None else None
@@ -109,6 +163,40 @@ def build_settings(
             ]
         }
     ]
+    if agent_launched_url is not None:
+        if subagent_stop_url is None:
+            # Derive from agent_launched_url as a convenience for callers that
+            # follow the /hook/agent-launched convention.  Raise early rather than
+            # silently wiring the wrong endpoint (str.replace returns the original
+            # string unchanged when the substring is absent).
+            if "/hook/agent-launched" not in agent_launched_url:
+                raise ValueError(
+                    f"Cannot derive subagent_stop_url from {agent_launched_url!r}: "
+                    "the URL must contain '/hook/agent-launched', "
+                    "or pass subagent_stop_url explicitly."
+                )
+            subagent_stop_url = agent_launched_url.replace("/hook/agent-launched", "/hook/subagent-stop")
+        hooks["PostToolUse"] = [
+            {
+                "matcher": "^Agent$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": posttool_hook_command(agent_launched_url),
+                    }
+                ],
+            }
+        ]
+        hooks["SubagentStop"] = [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": subagent_stop_hook_command(subagent_stop_url),
+                    }
+                ]
+            }
+        ]
     return {"hooks": hooks}
 
 
@@ -240,6 +328,8 @@ def write_merged_settings(
     extra_pretool_allow_rules: list[str] | None = None,
     extra_pretool_disallow_rules: list[str] | None = None,
     policy_file: Path | None = None,
+    agent_launched_url: str | None = None,
+    subagent_stop_url: str | None = None,
 ) -> GeneratedSettings:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "claude-settings.merged.json"
@@ -257,6 +347,8 @@ def write_merged_settings(
             extra_pretool_allow_rules=extra_pretool_allow_rules,
             extra_pretool_disallow_rules=extra_pretool_disallow_rules,
             policy_file=policy_file,
+            agent_launched_url=agent_launched_url,
+            subagent_stop_url=subagent_stop_url,
         ),
     )
     _write_json_atomic(path, data)
@@ -308,6 +400,50 @@ def ensure_skip_dangerous_mode_prompt(global_settings_path: Path | None = None) 
     if data.get("skipDangerousModePermissionPrompt") is True:
         return  # already set, nothing to do
     data["skipDangerousModePermissionPrompt"] = True
+    _write_json_atomic(path, data)
+
+
+def ensure_workspace_trust(workdir: Path, global_settings_path: Path | None = None) -> None:
+    """Write hasTrustDialogAccepted=true for *workdir* to ~/.claude.json.
+
+    Claude Code shows a "Quick safety check: Is this a project you trust?" prompt
+    the first time it opens a directory.  Writing ``hasTrustDialogAccepted=true``
+    under ``projects[<workdir>]`` in ``~/.claude.json`` (the main user-level state
+    file, distinct from ``~/.claude/settings.json``) is equivalent to having
+    accepted the prompt once interactively — exactly what Claude Code itself does
+    after the user clicks "Yes, I trust this folder".  Callers that set
+    ``auto_accept_workspace_trust=True`` have already opted in to unattended mode,
+    so pre-writing the key is the correct and reliable approach (vs. injecting key
+    sequences into the PTY, which is fragile).
+
+    The project key matches what Claude Code stores: ``process.cwd()`` run inside
+    the workdir, which on macOS returns the symlink-resolved path.
+    ``os.path.realpath`` is used (not ``os.path.abspath``) to match that behaviour.
+    """
+    path = global_settings_path or Path.home() / ".claude.json"
+    # Compute the project key the same way Claude Code does.  Claude Code writes the
+    # key using process.cwd() (run inside the workdir), which returns the real
+    # (symlink-resolved) path on macOS — e.g. /private/tmp/foo even if the caller
+    # passed /tmp/foo.  os.path.realpath follows symlinks to match that behaviour;
+    # os.path.abspath would not and would produce a mismatched key on macOS.
+    key = os.path.normpath(os.path.realpath(str(workdir)))
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+        data["projects"] = projects
+    project = projects.get(key)
+    if not isinstance(project, dict):
+        project = {}
+        projects[key] = project
+    if project.get("hasTrustDialogAccepted") is True:
+        return  # already set, nothing to do
+    project["hasTrustDialogAccepted"] = True
     _write_json_atomic(path, data)
 
 

@@ -341,6 +341,7 @@ def test_startup_acceptance_accepts_mcp_and_dev_channel_defaults() -> None:
     assert dev_name == "development-channels"
 
 
+
 def test_startup_acceptance_does_not_repeat_accepted_prompt() -> None:
     text = "WARNING: Bypass Permissions 1. No, exit 2. Yes, I accept Enter to confirm"
     assert _startup_acceptance_keys(text, {"bypass-permissions"}) == (None, None)
@@ -395,9 +396,11 @@ def test_drain_pty_to_log_bypass_permissions_prompt_not_handled_via_keys(tmp_pat
 
 
 def test_prepare_launch_spec_calls_ensure_skip_prompt_when_auto_accept_enabled(tmp_path, monkeypatch) -> None:
-    """When auto_accept_workspace_trust=True, prepare_launch_spec pre-writes the settings key."""
-    called = []
-    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: called.append(True))
+    """When auto_accept_workspace_trust=True, prepare_launch_spec pre-writes both settings keys."""
+    skip_calls = []
+    trust_calls = []
+    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: skip_calls.append(True))
+    monkeypatch.setattr(launcher, "ensure_workspace_trust", lambda p: trust_calls.append(p))
 
     registry = SessionRegistry()
     session = registry.create_or_get(
@@ -405,20 +408,25 @@ def test_prepare_launch_spec_calls_ensure_skip_prompt_when_auto_accept_enabled(t
     )
     session.metadata["auto_accept_workspace_trust"] = "True"
     prepare_launch_spec(session=session, state_dir=tmp_path, callback_base_url="http://127.0.0.1:1234")
-    assert called == [True]
+    assert skip_calls == [True]
+    assert len(trust_calls) == 1
+    assert trust_calls[0] == tmp_path
 
 
 def test_prepare_launch_spec_does_not_call_ensure_skip_prompt_when_auto_accept_disabled(tmp_path, monkeypatch) -> None:
-    """Without auto_accept_workspace_trust the settings key must not be touched."""
-    called = []
-    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: called.append(True))
+    """Without auto_accept_workspace_trust neither settings helper must be called."""
+    skip_calls = []
+    trust_calls = []
+    monkeypatch.setattr(launcher, "ensure_skip_dangerous_mode_prompt", lambda: skip_calls.append(True))
+    monkeypatch.setattr(launcher, "ensure_workspace_trust", lambda p: trust_calls.append(p))
 
     registry = SessionRegistry()
     session = registry.create_or_get(
         session_id="demo", ttl_seconds=3600, keep_alive=False, workdir=str(tmp_path)
     )
     prepare_launch_spec(session=session, state_dir=tmp_path, callback_base_url="http://127.0.0.1:1234")
-    assert called == []
+    assert skip_calls == []
+    assert trust_calls == []
 
 
 def test_prepare_launch_spec_writes_policy_file_and_embeds_path_in_hook(tmp_path) -> None:

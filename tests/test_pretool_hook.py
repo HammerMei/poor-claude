@@ -442,3 +442,5 @@ def test_pretool_hook_logs_raw_payload(tmp_path, monkeypatch) -> None:
     assert pretool_hook.main(["--log-path", str(log_path)]) == 2
     record = json.loads(log_path.read_text(encoding="utf-8").strip())
     assert '"tool_name":"Skill"' in record["raw"]
+
+

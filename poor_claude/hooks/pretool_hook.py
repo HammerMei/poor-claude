@@ -136,6 +136,7 @@ def _read_policy_file(path: str) -> tuple[list[str], list[str]]:
     return [], []
 
 
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--poor-claude-managed", action="store_true")
@@ -156,6 +157,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     permission_mode = payload.get("permission_mode") or "default"
+    tool_name = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or os.getcwd()
+    session_id = payload.get("session_id") or ""
 
     # In any non-default permission mode, Claude's own logic handles permissions
     # without showing blocking interactive dialogs:
@@ -168,10 +173,6 @@ def main(argv: list[str] | None = None) -> int:
     # block forever in a headless session — that's where we must step in.
     if permission_mode != "default":
         return 0
-
-    tool_name = payload.get("tool_name") or ""
-    tool_input = payload.get("tool_input") or {}
-    cwd = payload.get("cwd") or os.getcwd()
 
     # Collect rules from all sources.
     # Policy file (--policy-file) is read fresh on every invocation so the control

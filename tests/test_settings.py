@@ -6,10 +6,13 @@ from poor_claude.settings import (
     build_settings,
     cleanup_project_local_settings,
     ensure_skip_dangerous_mode_prompt,
+    ensure_workspace_trust,
     merge_settings,
+    posttool_hook_command,
     read_settings,
     strip_poor_claude_managed_settings,
     stop_hook_command,
+    subagent_stop_hook_command,
     write_project_local_settings,
     write_merged_settings,
     write_settings,
@@ -36,6 +39,8 @@ def test_build_settings_contains_stop_hook_only() -> None:
     assert "--poor-claude-managed" in settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert hook["type"] == "command"
     assert "poor_claude.hooks.stop_hook" in hook["command"]
+    # No PostToolUse hook when agent_launched_url is not provided
+    assert "PostToolUse" not in settings["hooks"]
 
 
 def test_build_settings_omits_pretool_hook_when_not_requested() -> None:
@@ -239,3 +244,144 @@ def test_ensure_skip_dangerous_mode_prompt_is_noop_when_already_set(tmp_path) ->
     ensure_skip_dangerous_mode_prompt(path)
     assert path.stat().st_mtime_ns == mtime_before, "file should not be rewritten when key already set"
     assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
+def test_posttool_hook_command_uses_local_module() -> None:
+    command = posttool_hook_command("http://127.0.0.1:1234/hook/agent-launched")
+    assert sys.executable in command
+    assert "-m poor_claude.hooks.posttool_hook" in command
+    assert "--poor-claude-managed" in command
+    assert "PYTHONPATH=" in command
+    assert "http://127.0.0.1:1234/hook/agent-launched" in command
+
+
+def test_subagent_stop_hook_command_uses_local_module() -> None:
+    command = subagent_stop_hook_command("http://127.0.0.1:1234/hook/subagent-stop")
+    assert sys.executable in command
+    assert "-m poor_claude.hooks.subagent_stop_hook" in command
+    assert "--poor-claude-managed" in command
+    assert "PYTHONPATH=" in command
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in command
+
+
+def test_build_settings_without_agent_launched_url_has_no_posttool_or_subagent_hooks() -> None:
+    settings = build_settings("http://127.0.0.1:1234/hook/stop")
+    assert "SubagentStop" not in settings["hooks"]
+    assert "PostToolUse" not in settings["hooks"]
+    pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--agent-started-url" not in pretool_cmd
+    assert "--callback-url" not in pretool_cmd or "posttool" not in pretool_cmd
+
+
+def test_build_settings_with_agent_launched_url_adds_posttool_and_subagent_stop_hooks() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
+    )
+    # PostToolUse hook with Agent-only matcher
+    assert "PostToolUse" in settings["hooks"]
+    posttool_entry = settings["hooks"]["PostToolUse"][0]
+    assert posttool_entry["matcher"] == "^Agent$"
+    posttool_hook = posttool_entry["hooks"][0]
+    assert posttool_hook["type"] == "command"
+    assert "poor_claude.hooks.posttool_hook" in posttool_hook["command"]
+    assert "http://127.0.0.1:1234/hook/agent-launched" in posttool_hook["command"]
+    # SubagentStop hook
+    assert "SubagentStop" in settings["hooks"]
+    subagent_hook = settings["hooks"]["SubagentStop"][0]["hooks"][0]
+    assert subagent_hook["type"] == "command"
+    assert "poor_claude.hooks.subagent_stop_hook" in subagent_hook["command"]
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook["command"]
+
+
+def test_build_settings_with_agent_launched_url_does_not_add_flag_to_pretool_hook() -> None:
+    """PreToolUse hook no longer carries agent-started notification logic."""
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
+    )
+    pretool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "--agent-started-url" not in pretool_cmd
+    assert "agent-launched" not in pretool_cmd
+
+
+def test_build_settings_with_agent_launched_url_keeps_hooks_when_pretool_excluded() -> None:
+    # Both PostToolUse(Agent) and SubagentStop must still be registered even when
+    # the pretool hook is disabled (bypassPermissions mode): background agents can
+    # still run and the control server still needs both signals.
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        include_pretool_hook=False,
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
+    )
+    assert "SubagentStop" in settings["hooks"]
+    assert "PostToolUse" in settings["hooks"]
+    assert "PreToolUse" not in settings["hooks"]
+
+
+def test_build_settings_accepts_explicit_subagent_stop_url() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
+        subagent_stop_url="http://127.0.0.1:1234/hook/subagent-stop",
+    )
+    subagent_hook_cmd = settings["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
+    assert "http://127.0.0.1:1234/hook/subagent-stop" in subagent_hook_cmd
+
+
+def test_build_settings_raises_when_agent_launched_url_cannot_be_derived() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="subagent_stop_url"):
+        build_settings(
+            "http://127.0.0.1:1234/hook/stop",
+            agent_launched_url="http://127.0.0.1:1234/hook/notify",  # missing /hook/agent-launched
+        )
+
+
+def test_strip_poor_claude_managed_settings_removes_posttool_and_subagent_stop_hooks() -> None:
+    settings = build_settings(
+        "http://127.0.0.1:1234/hook/stop",
+        agent_launched_url="http://127.0.0.1:1234/hook/agent-launched",
+    )
+    stripped = strip_poor_claude_managed_settings(settings)
+    assert stripped == {}
+
+
+def test_ensure_workspace_trust_creates_entry_when_none_exists(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    ensure_workspace_trust(tmp_path, path)
+    import os
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["projects"][key]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_workspace_trust_adds_to_existing_projects(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    other_key = "/some/other/project"
+    path.write_text(json.dumps({"projects": {other_key: {"hasTrustDialogAccepted": True}}}), encoding="utf-8")
+    ensure_workspace_trust(tmp_path, path)
+    import os
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["projects"][other_key]["hasTrustDialogAccepted"] is True
+    assert data["projects"][key]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_workspace_trust_is_noop_when_already_set(tmp_path) -> None:
+    import os
+    path = tmp_path / "settings.json"
+    key = os.path.normpath(os.path.realpath(str(tmp_path)))
+    original = {"projects": {key: {"hasTrustDialogAccepted": True, "otherKey": "preserved"}}}
+    path.write_text(json.dumps(original), encoding="utf-8")
+    mtime_before = path.stat().st_mtime_ns
+    ensure_workspace_trust(tmp_path, path)
+    assert path.stat().st_mtime_ns == mtime_before, "file should not be rewritten when key already set"
+
+
+def test_ensure_workspace_trust_preserves_other_settings_in_file(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"skipDangerousModePermissionPrompt": True}), encoding="utf-8")
+    ensure_workspace_trust(tmp_path, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["skipDangerousModePermissionPrompt"] is True

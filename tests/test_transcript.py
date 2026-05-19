@@ -424,6 +424,26 @@ def test_find_completed_task_ids_returns_multiple(tmp_path) -> None:
     assert set(ids) == {"btask1111", "btask2222"}
 
 
+def test_find_completed_task_ids_ignores_unknown_status(tmp_path) -> None:
+    """A status not in the whitelist (e.g. 'cancelled') must be silently ignored.
+
+    The whitelist design means an unrecognised status leaves the task in pending
+    (request waits until timeout) rather than completing prematurely.  This test
+    anchors that intended behaviour so future readers know the silent-ignore is
+    deliberate.
+    """
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req5">'}}),
+            json.dumps(_make_task_notification_event("btask5555", "cancelled")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req5")
+    assert ids == [], "unknown status 'cancelled' should be ignored, not treated as terminal"
+
+
 def test_find_completed_task_ids_no_cross_block_leakage(tmp_path) -> None:
     """Two <task-notification> blocks in a SINGLE user message must not cross-match.
 

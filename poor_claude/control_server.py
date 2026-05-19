@@ -377,13 +377,13 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # when a new end_turn response appears (e.g. after Claude resumes following
     # a SubagentStop task-notification).
     transcript_bg_agents_scanned = False
-    # Set to True when we discover ANY background agent for this request.
+    # Set to True when we discover ANY background work (Agent or Bash task).
     # Prevents _wait_for_response from finishing with a premature "LAUNCHED"
-    # response when all discovered agents already completed (SubagentStop fired
-    # before our transcript scan).  In that case pending_background_agent_ids
-    # is empty but we still need to wait for the second Stop hook to fire with
-    # the real final response.
-    bg_agent_detected = False
+    # response when all discovered work already completed before our transcript
+    # scan (SubagentStop / task-notification arrived first).  In that case
+    # pending_background_agent_ids is empty but we still need to wait for the
+    # second Stop hook to fire with the real final response.
+    bg_work_detected = False
     next_candidate_refresh = time.time() + 2.0
     while True:
         with state.lock:
@@ -461,10 +461,16 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                                 request_id=request.request_id,
                                 start_offset=transcript_offsets.get(str(candidate), 0),
                             )
-                            if found_agents or found_tasks or found_completed:
+                            # Accumulate completions from every candidate — a stale
+                            # task-notification in an earlier candidate must not mask
+                            # a launch that only appears in a later candidate.
+                            for tid in found_completed:
+                                if tid not in completed_tasks:
+                                    completed_tasks.append(tid)
+                            if found_agents or found_tasks:
+                                # Found the candidate that has the launches; stop here.
                                 newly_discovered = found_agents
                                 newly_discovered_tasks = found_tasks
-                                completed_tasks = found_completed
                                 break
                     else:
                         newly_discovered = []
@@ -483,7 +489,7 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             if tid not in session.completed_agent_ids and tid not in session.pending_background_agent_ids:
                                 session.pending_background_agent_ids.add(tid)
                         if newly_discovered or newly_discovered_tasks:
-                            bg_agent_detected = True
+                            bg_work_detected = True
                             # First-one-wins: store the premature transcript
                             # response as the intermediate output so it can be
                             # prepended to the final response.  Guard against
@@ -510,10 +516,10 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             stable_transcript_response = None  # force re-stabilisation
                             stable_transcript_signature = None
                             transcript_bg_agents_scanned = False  # Rescan on next stable response
-                        elif bg_agent_detected:
-                            # All discovered background agents already completed
-                            # (SubagentStop fired before our transcript scan so they
-                            # landed in completed_agent_ids instead of pending).
+                        elif bg_work_detected:
+                            # All discovered background work already completed before
+                            # our transcript scan (SubagentStop / task-notification
+                            # arrived first, landing IDs in completed_agent_ids).
                             # Do NOT finish here — the second Stop hook will fire
                             # after Claude resumes and outputs the real final response,
                             # and that Stop handler calls finish_request_for_route with
@@ -890,6 +896,17 @@ def make_handler(state: ControlState):
                 completed_tasks: list[str] = []
                 if isinstance(transcript_path_str, str) and isinstance(request_id, str):
                     try:
+                        # All three calls use the default start_offset=0, which
+                        # triggers a 1 MB tail-read.  The Stop hook payload does
+                        # not carry a byte offset, and poor-claude does not yet
+                        # record the transcript file size at request-start time,
+                        # so we cannot seek directly.  For sessions whose transcript
+                        # exceeds 1 MB before the current request begins, the
+                        # launch event may lie outside the tail window; the
+                        # request_id marker scoping prevents cross-request confusion
+                        # but will silently return [] if the marker is out of range.
+                        # TODO: extend the hook payload or PendingRequest to carry
+                        # a start_offset so we can seek past earlier requests.
                         discovered_agents = find_background_agent_ids_in_transcript(
                             Path(transcript_path_str), request_id=request_id
                         )

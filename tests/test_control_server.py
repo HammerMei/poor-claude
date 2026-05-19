@@ -2136,7 +2136,7 @@ def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_alrea
       2. Transcript polling stabilises on "LAUNCHED" (end_turn) after 0.5 s.
       3. Transcript scan finds "race-agent"; it's in completed_agent_ids → pending stays empty.
       4. Old code: pending=0 → finish("LAUNCHED") ← BUG
-         New code: bg_agent_detected=True, pending=0 → reset timer, keep looping.
+         New code: bg_work_detected=True, pending=0 → reset timer, keep looping.
       5. Second Stop hook fires with "BG-DONE" → finish_request_for_route → request done.
     """
     state = ControlState()
@@ -2197,11 +2197,11 @@ def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_alrea
         # window + a comfortable margin).  Old code would finish with "LAUNCHED" here.
         time.sleep(1.5)
 
-        # Request must still be active — bg_agent_detected guard prevents early finish.
+        # Request must still be active — bg_work_detected guard prevents early finish.
         listed = request_json("GET", f"{address}/sessions")
         assert listed["sessions"][0]["active_request"] is not None, (
             "request completed prematurely with stale 'LAUNCHED' response — "
-            "bg_agent_detected guard is not preventing early completion"
+            "bg_work_detected guard is not preventing early completion"
         )
 
         # Second Stop hook fires with the real final response.
@@ -2611,6 +2611,117 @@ def test_stop_hook_bash_task_killed_status_treated_as_terminal(tmp_path) -> None
         server.server_close()
 
 
+def test_wait_for_response_bash_task_not_missed_when_completion_only_in_first_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    """The _wait_for_response candidate loop must NOT stop when a candidate has only
+    find_completed results but no launch — it must continue scanning other candidates.
+
+    Scenario:
+      candidate A: find_tasks=[], find_completed=["btask8888"]  (stale notification, no launch)
+      candidate B: find_tasks=["btask8888"], find_completed=["btask8888"]
+
+    OLD (buggy) behaviour: break at A because found_completed is truthy →
+      newly_discovered_tasks=[] → bg_work_detected stays False → pending=0 →
+      finish_request_for_route("LAUNCHED") prematurely.
+
+    NEW (correct) behaviour: don't break at A (no launch) → continue to B →
+      find launch → add to pending → discard (completed) → net pending=0 →
+      bg_work_detected=True → elif branch → keep looping → Stop hook finishes.
+    """
+    candidate_a = tmp_path / "candidate_a.jsonl"
+    candidate_b = tmp_path / "candidate_b.jsonl"
+    candidate_a.write_text("", encoding="utf-8")
+    candidate_b.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.transcript_candidates",
+        lambda **_kw: [candidate_a, candidate_b],
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse("LAUNCHED", stop_reason="end_turn"),
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+
+    def fake_find_tasks(path, **_kw):
+        # Only candidate B has the launch.
+        return ["btask8888"] if path == candidate_b else []
+
+    def fake_find_completed(path, **_kw):
+        # Candidate A carries a stale completion with no corresponding launch.
+        # Candidate B also has the completion (same task).
+        return ["btask8888"] if path in (candidate_a, candidate_b) else []
+
+    monkeypatch.setattr("poor_claude.control_server.find_background_task_ids_in_transcript", fake_find_tasks)
+    monkeypatch.setattr("poor_claude.control_server.find_completed_task_ids_in_transcript", fake_find_completed)
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "run bash task",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Wait for the transcript scan to fire (>0.5 s quiet window + margin).
+        # With the OLD buggy break condition, the request would finish here with
+        # "LAUNCHED" because candidate A's completion-only result stops the loop.
+        time.sleep(1.5)
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is not None, (
+            "request completed prematurely — candidate loop broke early on "
+            "completion-only candidate A before scanning candidate B for the launch"
+        )
+
+        # Stop hook fires with the real final response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-DONE", "cwd": str(tmp_path)},
+        )
+
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "LAUNCHED\n\nBG-DONE"
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_wait_for_response_bash_task_completed_before_scan(
     tmp_path, monkeypatch
 ) -> None:
@@ -2621,7 +2732,7 @@ def test_wait_for_response_bash_task_completed_before_scan(
     The scan simultaneously finds task launch AND completion in the transcript:
       1. find_background_task_ids → ["btasktest1"] (add to pending)
       2. find_completed_task_ids → ["btasktest1"] (discard from pending)
-      3. Net result: pending=0, bg_agent_detected=True → elif branch → keep looping.
+      3. Net result: pending=0, bg_work_detected=True → elif branch → keep looping.
       4. Stop hook fires with real final response → finish.
       5. response must be "LAUNCHED\\n\\nBG-DONE".
     """
@@ -2676,15 +2787,15 @@ def test_wait_for_response_bash_task_completed_before_scan(
         assert session_id is not None, "request never became active"
 
         # Wait long enough for transcript polling (>0.5 s quiet window + comfortable margin).
-        # Old code without bg_agent_detected guard would finish with "LAUNCHED" here.
+        # Old code without bg_work_detected guard would finish with "LAUNCHED" here.
         time.sleep(1.5)
 
-        # Request must still be active — bg_agent_detected prevents early finish even
+        # Request must still be active — bg_work_detected prevents early finish even
         # when pending is empty (task was launched and completed in the same scan window).
         listed = request_json("GET", f"{address}/sessions")
         assert listed["sessions"][0]["active_request"] is not None, (
             "request completed prematurely with stale 'LAUNCHED' response — "
-            "bg_agent_detected guard not working for Bash tasks"
+            "bg_work_detected guard not working for Bash tasks"
         )
 
         # Stop hook fires with the real final response.

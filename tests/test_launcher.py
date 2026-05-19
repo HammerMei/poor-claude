@@ -341,6 +341,28 @@ def test_startup_acceptance_accepts_mcp_and_dev_channel_defaults() -> None:
     assert dev_name == "development-channels"
 
 
+def test_startup_acceptance_accepts_workspace_trust_prompt() -> None:
+    """Workspace trust prompt ("Quick safety check") is auto-accepted with Enter."""
+    keys, name = _startup_acceptance_keys(
+        "Quick safety check: Is this a project you created or one you trust? "
+        "1. Yes, I trust this folder "
+        "2. No, exit "
+        "Enter to confirm"
+    )
+    # Option-1 ("Yes, I trust this folder") is highlighted by default; just Enter.
+    assert keys == [b"\r"]
+    assert name == "workspace-trust"
+
+
+def test_startup_acceptance_workspace_trust_not_repeated() -> None:
+    """workspace-trust prompt is not sent twice."""
+    text = (
+        "Quick safety check: Is this a project you created or one you trust? "
+        "1. Yes, I trust this folder 2. No, exit Enter to confirm"
+    )
+    assert _startup_acceptance_keys(text, {"workspace-trust"}) == (None, None)
+
+
 def test_startup_acceptance_does_not_repeat_accepted_prompt() -> None:
     text = "WARNING: Bypass Permissions 1. No, exit 2. Yes, I accept Enter to confirm"
     assert _startup_acceptance_keys(text, {"bypass-permissions"}) == (None, None)

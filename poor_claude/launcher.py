@@ -371,6 +371,15 @@ def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) ->
         if "development-channels" not in accepted:
             # Option-1 is already highlighted by default; just confirm with Enter.
             return [b"\r"], "development-channels"
+    if (
+        "quick safety check" in text
+        and "yes, i trust this folder" in text
+        and "no, exit" in text
+        and "enter to confirm" in text
+    ):
+        if "workspace-trust" not in accepted:
+            # Option-1 ("Yes, I trust this folder") is already highlighted; confirm with Enter.
+            return [b"\r"], "workspace-trust"
     return None, None
 
 

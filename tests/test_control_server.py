@@ -2042,6 +2042,101 @@ def test_stop_hook_transcript_scan_race_subagent_stops_first(tmp_path) -> None:
         server.server_close()
 
 
+def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_already_done(
+    tmp_path, monkeypatch
+) -> None:
+    """_wait_for_response must NOT finish with the premature transcript response when
+    SubagentStop already fired before the transcript scan.
+
+    Race flow:
+      1. SubagentStop fires → completed_agent_ids = {"race-agent"}, pending stays empty.
+      2. Transcript polling stabilises on "LAUNCHED" (end_turn) after 0.5 s.
+      3. Transcript scan finds "race-agent"; it's in completed_agent_ids → pending stays empty.
+      4. Old code: pending=0 → finish("LAUNCHED") ← BUG
+         New code: bg_agent_detected=True, pending=0 → reset timer, keep looping.
+      5. Second Stop hook fires with "BG-DONE" → finish_request_for_route → request done.
+    """
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse("LAUNCHED", stop_reason="end_turn"),
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: ["race-agent"],
+    )
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "launch bg agent",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to be queued.
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # SubagentStop fires FIRST — before _wait_for_response scans the transcript.
+        # Agent lands in completed_agent_ids; pending stays empty.
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "race-agent"},
+        )
+
+        # Wait long enough for the transcript polling cycle to fire (>0.5 s quiet
+        # window + a comfortable margin).  Old code would finish with "LAUNCHED" here.
+        time.sleep(1.5)
+
+        # Request must still be active — bg_agent_detected guard prevents early finish.
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is not None, (
+            "request completed prematurely with stale 'LAUNCHED' response — "
+            "bg_agent_detected guard is not preventing early completion"
+        )
+
+        # Second Stop hook fires with the real final response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-DONE", "cwd": str(tmp_path)},
+        )
+
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "BG-DONE"
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_subagent_stop_adds_to_completed_agent_ids(tmp_path) -> None:
     """SubagentStop populates completed_agent_ids so race-guard works even without pending set."""
     server, address = start_test_server()

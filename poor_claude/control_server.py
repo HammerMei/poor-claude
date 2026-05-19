@@ -371,6 +371,13 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # when a new end_turn response appears (e.g. after Claude resumes following
     # a SubagentStop task-notification).
     transcript_bg_agents_scanned = False
+    # Set to True when we discover ANY background agent for this request.
+    # Prevents _wait_for_response from finishing with a premature "LAUNCHED"
+    # response when all discovered agents already completed (SubagentStop fired
+    # before our transcript scan).  In that case pending_background_agent_ids
+    # is empty but we still need to wait for the second Stop hook to fire with
+    # the real final response.
+    bg_agent_detected = False
     next_candidate_refresh = time.time() + 2.0
     while True:
         with state.lock:
@@ -444,6 +451,8 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         for aid in newly_discovered:
                             if aid not in session.completed_agent_ids and aid not in session.pending_background_agent_ids:
                                 session.pending_background_agent_ids.add(aid)
+                        if newly_discovered:
+                            bg_agent_detected = True
                         if len(session.pending_background_agent_ids) > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
@@ -459,6 +468,16 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             stable_transcript_response = None  # force re-stabilisation
                             stable_transcript_signature = None
                             transcript_bg_agents_scanned = False  # Rescan on next stable response
+                        elif bg_agent_detected:
+                            # All discovered background agents already completed
+                            # (SubagentStop fired before our transcript scan so they
+                            # landed in completed_agent_ids instead of pending).
+                            # Do NOT finish here — the second Stop hook will fire
+                            # after Claude resumes and outputs the real final response,
+                            # and that Stop handler calls finish_request_for_route with
+                            # the correct content.  Just reset the stability timer so
+                            # we keep looping efficiently until active_request → None.
+                            stable_transcript_since = time.time()
                         else:
                             state.registry.finish_request_for_route(
                                 route=session.route_key,

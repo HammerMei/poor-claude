@@ -1198,6 +1198,93 @@ def test_control_server_timeout_clears_stopping_flag_when_termination_fails(tmp_
         server.server_close()
 
 
+def test_wait_for_response_timeout_prepends_intermediate_response(tmp_path, monkeypatch) -> None:
+    """On timeout with a transcript fallback, intermediate_response must be prepended.
+
+    Flow:
+      1. Transcript polling finds a background Bash task ("btask-001") → bg_work_detected=True,
+         intermediate_response set to "LAUNCHED" (the first stable transcript response).
+      2. Pending task keeps _wait_for_response looping.
+      3. Transcript then stabilises on "PARTIAL OUTPUT" → transcript_fallback_response.
+      4. Request times out (task never completes — no terminal <task-notification>).
+      5. Response must be "LAUNCHED\\n\\nPARTIAL OUTPUT", not just "PARTIAL OUTPUT".
+    """
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    read_calls: dict[str, int] = {"count": 0}
+    task_scan_calls: dict[str, int] = {"count": 0}
+
+    def fake_read_response(*_a, **_kw):
+        read_calls["count"] += 1
+        # First two polls → "LAUNCHED" (becomes stable, triggers bg-task scan).
+        # Subsequent polls → "PARTIAL OUTPUT" (different value → becomes new stable,
+        # is stored as transcript_fallback_response when timeout fires).
+        if read_calls["count"] <= 2:
+            return TranscriptResponse("LAUNCHED", stop_reason="end_turn")
+        return TranscriptResponse("PARTIAL OUTPUT", stop_reason="end_turn")
+
+    def fake_find_tasks(*_a, **_kw):
+        # First scan: report the task so bg_work_detected=True and intermediate_response
+        # is set.  Subsequent scans: return [] so pending never grows further.
+        task_scan_calls["count"] += 1
+        return ["btask-001"] if task_scan_calls["count"] == 1 else []
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        fake_read_response,
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_task_ids_in_transcript",
+        fake_find_tasks,
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_completed_task_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+
+    result_holder: dict[str, object] = {}
+
+    def run_request():
+        try:
+            result_holder["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "hello",
+                    "timeout_seconds": 3,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+            )
+        except Exception as exc:
+            result_holder["error"] = exc
+
+    req_thread = threading.Thread(target=run_request, daemon=True)
+    req_thread.start()
+    req_thread.join(timeout=8)
+
+    try:
+        assert "error" not in result_holder, f"request raised unexpectedly: {result_holder.get('error')}"
+        result = result_holder.get("result")
+        assert result is not None, "request thread did not complete"
+        assert result["response"] == "LAUNCHED\n\nPARTIAL OUTPUT", (
+            "timeout path must prepend intermediate_response to transcript fallback; "
+            f"got: {result['response']!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_delete_does_not_hold_state_lock_while_stopping_process(tmp_path) -> None:
     state = ControlState()
     fake_process = SlowFakeProcess()

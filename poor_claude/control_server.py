@@ -589,6 +589,9 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             state.condition.notify_all()
                 if termination_error is not None:
                     if response_from_transcript is not None:
+                        intermediate = request.intermediate_response
+                        if intermediate and intermediate != response_from_transcript:
+                            return f"{intermediate}\n\n{response_from_transcript}"
                         return response_from_transcript
                     raise RuntimeError(f"timed out waiting for Claude response; failed to stop process: {termination_error}")
             else:
@@ -597,6 +600,9 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         session.metadata["process_stopping"] = "False"
                         state.condition.notify_all()
             if response_from_transcript is not None:
+                intermediate = request.intermediate_response
+                if intermediate and intermediate != response_from_transcript:
+                    return f"{intermediate}\n\n{response_from_transcript}"
                 return response_from_transcript
             raise TimeoutError("timed out waiting for Claude response")
 

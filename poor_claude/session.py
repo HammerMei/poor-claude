@@ -66,8 +66,15 @@ class SessionRecord:
     # ID-collision invariant: agent IDs match ``[A-Za-z0-9_-]+`` and Bash task
     # IDs match ``[a-z0-9]+`` (observed format; verified against real transcripts).
     # The task-ID regex only matches lowercase alphanumeric, so agent IDs that
-    # include uppercase letters or hyphens cannot alias a task ID.  If Claude Code
-    # ever changes the task-ID format, this assumption must be revisited.
+    # contain at least one uppercase letter or ``[-_]`` character cannot alias a
+    # task ID.  However, an all-lowercase-alphanumeric agent ID (e.g. "abc123")
+    # is indistinguishable from a task ID by format alone — a SubagentStop for
+    # such an agent would incorrectly discard a same-named pending Bash task and
+    # vice versa, causing silent under-counting and premature request completion.
+    # In practice Claude Code always generates agent IDs with uppercase letters or
+    # hyphens, so collisions have not been observed.  If Claude Code ever changes
+    # its agent-ID format, the sets should be split into separate agent and task
+    # ID tracking structures.
     pending_background_agent_ids: set = field(default_factory=set)
     # Accumulates IDs of background work that has *completed* during the current
     # request.  Used by the transcript-scan logic to avoid re-adding items that

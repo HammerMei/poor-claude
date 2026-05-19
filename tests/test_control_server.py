@@ -1885,3 +1885,206 @@ def test_transcript_path_does_not_complete_immediately_after_subagent_stop(tmp_p
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Transcript-scan background-agent detection (PostToolUse doesn't fire in
+# bypassPermissions mode — Stop hook must scan transcript instead)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _write_bg_agent_transcript(path: Path, request_id: str, agent_id: str) -> None:
+    """Write a minimal transcript with a background-agent launch under *request_id*."""
+    tool_result_text = (
+        f"Async agent launched successfully.\n"
+        f"agentId: {agent_id} (internal ID - do not mention to user.)\n"
+        f"The agent is working in the background."
+    )
+    events = [
+        # Request marker
+        {"message": {"role": "user", "content": [
+            {"type": "text", "text": f'<poor-claude-request id="{request_id}">'},
+        ]}},
+        # Tool_use (assistant launches background agent)
+        {"message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_test", "name": "Agent",
+             "input": {"run_in_background": True, "prompt": "do work"}},
+        ]}},
+        # Tool_result (Async launch confirmation with agentId)
+        {"message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_test",
+             "content": [{"type": "text", "text": tool_result_text}]},
+        ]}},
+        # Assistant premature response
+        {"message": {"role": "assistant", "content": "LAUNCHED", "stop_reason": "end_turn"}},
+    ]
+    path.write_text("\n".join(_json.dumps(e) for e in events), encoding="utf-8")
+
+
+def test_stop_hook_defers_via_transcript_scan(tmp_path) -> None:
+    """Stop hook discovers background agents from transcript when PostToolUse never fired."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "launch bg agent",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+
+        # Write a transcript that has the bg agent launch (PostToolUse never fired)
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bg_agent_transcript(transcript, request_id=request_id, agent_id="tx-agent-001")
+
+        # Stop hook fires with transcript_path pointing to our transcript
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "LAUNCHED",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert stop_response.get("deferred") is True
+
+        # Request must still be active
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] == queued["request_id"]
+
+        # SubagentStop fires with the discovered agentId
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "tx-agent-001"},
+        )
+
+        # Final Stop (real response after task-notification)
+        final_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "BG-DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert final_stop == {"ok": True}
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stop_hook_transcript_scan_race_subagent_stops_first(tmp_path) -> None:
+    """SubagentStop fires before the Stop hook scan: completed_agent_ids prevents defer loop."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "launch bg agent",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+
+        # SubagentStop fires FIRST (background agent completed quickly)
+        subagent_stop = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "fast-agent"},
+        )
+        assert subagent_stop["ok"] is True
+
+        # Now write transcript (as if the session log caught up)
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bg_agent_transcript(transcript, request_id=request_id, agent_id="fast-agent")
+
+        # Stop hook fires — transcript scan finds "fast-agent" but it's already in
+        # completed_agent_ids, so it must NOT be added to pending → complete immediately.
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "BG-DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert stop_response == {"ok": True}
+        assert "deferred" not in stop_response
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_subagent_stop_adds_to_completed_agent_ids(tmp_path) -> None:
+    """SubagentStop populates completed_agent_ids so race-guard works even without pending set."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 5,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+
+        # SubagentStop for an agent that was never in pending (PostToolUse never fired)
+        r = request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "ghost-agent"},
+        )
+        assert r["ok"] is True
+
+        # Write transcript with that same ghost-agent
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bg_agent_transcript(transcript, request_id=request_id, agent_id="ghost-agent")
+
+        # Stop hook — ghost-agent must be in completed_agent_ids → no defer
+        stop_r = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "done",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert stop_r == {"ok": True}
+        assert "deferred" not in stop_r
+    finally:
+        server.shutdown()
+        server.server_close()

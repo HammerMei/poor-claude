@@ -22,7 +22,7 @@ from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
 from poor_claude.settings import cleanup_project_local_settings
 from poor_claude.session import SessionRegistry
-from poor_claude.transcript import read_response_record_after_request_from_file, transcript_candidates
+from poor_claude.transcript import find_background_agent_ids_in_transcript, read_response_record_after_request_from_file, transcript_candidates
 
 
 class ControlState:
@@ -366,6 +366,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     stable_transcript_signature = None
     stable_transcript_since = 0.0
     transcript_fallback_response = None
+    # Set to True after we scan the transcript for background agents once per
+    # stable-response window; reset whenever the response changes so we rescan
+    # when a new end_turn response appears (e.g. after Claude resumes following
+    # a SubagentStop task-notification).
+    transcript_bg_agents_scanned = False
     next_candidate_refresh = time.time() + 2.0
     while True:
         with state.lock:
@@ -407,14 +412,38 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                 stable_transcript_response = transcript_response
                 stable_transcript_signature = transcript_signature
                 stable_transcript_since = now
+                # New content → rescan for background agents on next stable window.
+                transcript_bg_agents_scanned = False
             elif now - stable_transcript_since < transcript_quiet_seconds:
                 pass
             else:
                 transcript_fallback_response = transcript_response
                 if transcript_stop_reason == "end_turn":
+                    # Scan the transcript for background agents not registered via
+                    # PostToolUse (PostToolUse doesn't fire in bypassPermissions mode).
+                    # Only scan once per stable-response window to avoid repeated I/O.
+                    if not transcript_bg_agents_scanned:
+                        transcript_bg_agents_scanned = True
+                        newly_discovered: list[str] = []
+                        for candidate in candidates:
+                            found = find_background_agent_ids_in_transcript(
+                                candidate,
+                                request_id=request.request_id,
+                                start_offset=transcript_offsets.get(str(candidate), 0),
+                            )
+                            if found:
+                                newly_discovered = found
+                                break
+                    else:
+                        newly_discovered = []
                     with state.lock:
                         if state.registry._sessions.get(session.route_key) is not session:
                             raise RuntimeError("session route no longer exists")
+                        # Register newly discovered background agents that haven't
+                        # already completed (SubagentStop may fire before we scan).
+                        for aid in newly_discovered:
+                            if aid not in session.completed_agent_ids and aid not in session.pending_background_agent_ids:
+                                session.pending_background_agent_ids.add(aid)
                         if len(session.pending_background_agent_ids) > 0:
                             # Background agents are still running; the transcript
                             # shows the premature "launched" turn.  Reset the
@@ -429,6 +458,7 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             stable_transcript_since = time.time()
                             stable_transcript_response = None  # force re-stabilisation
                             stable_transcript_signature = None
+                            transcript_bg_agents_scanned = False  # Rescan on next stable response
                         else:
                             state.registry.finish_request_for_route(
                                 route=session.route_key,
@@ -788,6 +818,20 @@ def make_handler(state: ControlState):
                 request_id = payload.get("request_id")
                 response = str(payload.get("response", ""))
                 workdir = str(payload.get("cwd") or payload.get("workdir") or os.getcwd())
+                transcript_path_str = payload.get("transcript_path")
+                # Scan the transcript for background agents that were not registered
+                # via PostToolUse (PostToolUse doesn't fire in bypassPermissions mode).
+                # This must happen BEFORE acquiring the lock so we don't hold the lock
+                # during file I/O, and BEFORE the completed_request_ids check so we
+                # can populate pending_background_agent_ids even on the first Stop.
+                discovered_agents: list[str] = []
+                if isinstance(transcript_path_str, str) and isinstance(request_id, str):
+                    try:
+                        discovered_agents = find_background_agent_ids_in_transcript(
+                            Path(transcript_path_str), request_id=request_id
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # best-effort; transcript may not be available yet
                 with state.lock:
                     session = state.registry.get(session_id, workdir=workdir)
                     if session is None:
@@ -808,6 +852,11 @@ def make_handler(state: ControlState):
                     if request_id in session.completed_request_ids:
                         self._send_json(200, {"ok": True, "duplicate": True})
                         return
+                    # Register newly discovered background agents that haven't
+                    # already completed (SubagentStop may fire before this Stop hook).
+                    for aid in discovered_agents:
+                        if aid not in session.completed_agent_ids and aid not in session.pending_background_agent_ids:
+                            session.pending_background_agent_ids.add(aid)
                     if len(session.pending_background_agent_ids) > 0:
                         # Background agents are still running.  Defer completion
                         # until SubagentStop fires for each of them and the set
@@ -878,6 +927,9 @@ def make_handler(state: ControlState):
                         self._send_json(200, {"ok": True, "no_session": True})
                         return
                     if isinstance(agent_id, str) and agent_id:
+                        # Track completed agents so the transcript-scan logic can
+                        # avoid re-adding agents that already finished.
+                        session.completed_agent_ids.add(agent_id)
                         session.pending_background_agent_ids.discard(agent_id)
                     pending_count = len(session.pending_background_agent_ids)
                     state.condition.notify_all()

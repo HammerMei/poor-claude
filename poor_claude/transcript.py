@@ -10,6 +10,7 @@ from pathlib import Path
 
 SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 MAX_TRANSCRIPT_READ_BYTES = 1024 * 1024  # fallback when no offset is known
+_BACKGROUND_AGENT_ID_RE = re.compile(r"agentId:\s+([A-Za-z0-9_-]+)")
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,80 @@ def _read_recent_text(path: Path, *, max_bytes: int) -> str:
 
 def _claude_project_dir_name(workdir: str) -> str:
     return "".join("-" if ch == "/" else ch for ch in str(Path(workdir).expanduser().resolve()) if ch != ".")
+
+
+def find_background_agent_ids_in_transcript(
+    path: Path, *, request_id: str, start_offset: int = 0
+) -> list[str]:
+    """Return agentIds of background Agent launches that occurred during *request_id*.
+
+    Scans tool_result content blocks that appear after the
+    ``<poor-claude-request id="...">`` marker and extracts agentIds from
+    "Async agent launched successfully." messages.  Used by the Stop hook handler
+    and the transcript-polling loop to discover background agents when PostToolUse
+    does not fire (e.g. in bypassPermissions mode).
+
+    *start_offset* is an optional byte offset into *path* to start reading from
+    (for efficiency; the request marker is still used to scope the results
+    correctly even when start_offset > 0).
+    """
+    if not path.exists():
+        return []
+    seen_request = False
+    agent_ids: list[str] = []
+    try:
+        if start_offset > 0:
+            lines = _read_from_offset(path, start_offset=start_offset).splitlines()
+        else:
+            lines = _read_recent_text(path, max_bytes=MAX_TRANSCRIPT_READ_BYTES).splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "user":
+            # Check for the poor-claude request marker first (may be in the same
+            # message as a tool_result — do NOT skip to next line after finding it).
+            user_text = _content_to_text(content)
+            if f'<poor-claude-request id="{request_id}">' in user_text:
+                seen_request = True
+            if not seen_request:
+                continue
+            # Scan tool_result items for background agent launches
+            for text in _tool_result_texts(content):
+                if "Async agent launched successfully" in text:
+                    for match in _BACKGROUND_AGENT_ID_RE.finditer(text):
+                        aid = match.group(1)
+                        if aid not in agent_ids:
+                            agent_ids.append(aid)
+    return agent_ids
+
+
+def _tool_result_texts(content: object) -> list[str]:
+    """Extract text strings from tool_result content blocks in a message content list."""
+    if not isinstance(content, list):
+        return []
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_result":
+            continue
+        item_content = item.get("content")
+        if isinstance(item_content, str):
+            texts.append(item_content)
+        elif isinstance(item_content, list):
+            for sub in item_content:
+                if isinstance(sub, dict) and sub.get("type") == "text" and isinstance(sub.get("text"), str):
+                    texts.append(sub["text"])
+    return texts
 
 
 def _content_to_text(content: object) -> str:

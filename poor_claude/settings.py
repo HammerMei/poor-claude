@@ -404,25 +404,23 @@ def ensure_skip_dangerous_mode_prompt(global_settings_path: Path | None = None) 
 
 
 def ensure_workspace_trust(workdir: Path, global_settings_path: Path | None = None) -> None:
-    """Write hasTrustDialogAccepted=true for *workdir* to ~/.claude/settings.json.
+    """Write hasTrustDialogAccepted=true for *workdir* to ~/.claude.json.
 
     Claude Code shows a "Quick safety check: Is this a project you trust?" prompt
     the first time it opens a directory.  Writing ``hasTrustDialogAccepted=true``
-    under ``projects[<workdir>]`` in the global user settings is equivalent to
-    having accepted the prompt once interactively — exactly what Claude Code
-    itself does after the user clicks "Yes, I trust this folder".  Callers that
-    set ``auto_accept_workspace_trust=True`` have already opted in to unattended
-    mode, so pre-writing the key is the correct and reliable approach (vs.
-    injecting key sequences into the PTY, which is fragile).
+    under ``projects[<workdir>]`` in ``~/.claude.json`` (the main user-level state
+    file, distinct from ``~/.claude/settings.json``) is equivalent to having
+    accepted the prompt once interactively — exactly what Claude Code itself does
+    after the user clicks "Yes, I trust this folder".  Callers that set
+    ``auto_accept_workspace_trust=True`` have already opted in to unattended mode,
+    so pre-writing the key is the correct and reliable approach (vs. injecting key
+    sequences into the PTY, which is fragile).
 
-    The project key matches what Claude Code computes via
-    ``k58(path.resolve(workdir))``, which on POSIX is
-    ``os.path.normpath(os.path.abspath(workdir))``.  ``os.path.abspath`` is used
-    intentionally (not ``Path.resolve``) because Node's ``path.resolve`` does NOT
-    follow symlinks, whereas Python's ``Path.resolve`` does — using the wrong one
-    would silently fail on symlinked workdirs.
+    The project key matches what Claude Code stores: ``process.cwd()`` run inside
+    the workdir, which on macOS returns the symlink-resolved path.
+    ``os.path.realpath`` is used (not ``os.path.abspath``) to match that behaviour.
     """
-    path = global_settings_path or Path.home() / ".claude" / "settings.json"
+    path = global_settings_path or Path.home() / ".claude.json"
     # Compute the project key the same way Claude Code does.  Claude Code writes the
     # key using process.cwd() (run inside the workdir), which returns the real
     # (symlink-resolved) path on macOS — e.g. /private/tmp/foo even if the caller

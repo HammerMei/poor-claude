@@ -147,7 +147,7 @@ tool call.
 | `prompt` | Positional prompt argument |
 | `-p`, `--print` | Read prompt from stdin |
 | `--output-format` | `text` (default), `json`, `stream-json` |
-| `--timeout` | Response timeout in seconds (default: 300) |
+| `--timeout` | Response timeout in seconds (default: `POOR_CLAUDE_TIMEOUT_SECONDS` env var or 300) |
 
 ### Session
 
@@ -192,6 +192,16 @@ tool call.
 | `--dry-run` | Print the resolved request envelope without sending |
 | `--debug` | Print raw server response to stderr |
 | `--json` | Use JSON output for `--sessions` / `--prune-sessions` |
+
+## Environment variables
+
+These can be set in your shell profile or systemd/launchd service to tune defaults without changing the command line.
+
+| Variable | Description | Default |
+|---|---|---|
+| `POOR_CLAUDE_TIMEOUT_SECONDS` | Default request timeout (seconds). CLI `--timeout` takes priority. | `300` |
+| `POOR_CLAUDE_TTL_SECONDS` | Default session TTL (seconds). CLI `--ttl` takes priority. | `900` (auto) / `3600` (named) |
+| `POOR_CLAUDE_STATE` | Path to the daemon state file. | `~/.poor-claude/daemon.json` |
 
 ## Architecture notes
 

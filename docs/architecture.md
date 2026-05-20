@@ -159,6 +159,27 @@ handler that is waiting for the reply.
 If Claude produces no textual response (e.g. tool-only turns), the hook still fires
 and the daemon delivers an empty string to the client.
 
+### Background task deferral
+
+When the Stop hook fires, the daemon scans the session transcript for two kinds of
+pending background work launched during the current request:
+
+- **Background agents** (`Agent(run_in_background=True)`) — detected via
+  `"Async agent launched successfully. agentId: …"` in tool results.  Completion
+  is signalled by a `SubagentStop` hook callback.
+- **Background Bash tasks** (`Bash(run_in_background=True)`) — detected via
+  `"Command running in background with ID: …"` in tool results.  Completion is
+  detected by scanning subsequent `<task-notification>` blocks in the transcript.
+
+If any background work is still pending when the Stop hook fires, the daemon
+**defers** the final response: it stores the intermediate assistant text, keeps
+the request open, and continues polling the transcript until all pending agents
+and tasks reach a terminal state.  The combined output (intermediate text +
+final output) is then returned to the caller.
+
+This ensures that callers always receive the full result of a background
+script/agent — not just the "started in background" message.
+
 ---
 
 ## Daemon and state

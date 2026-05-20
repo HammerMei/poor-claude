@@ -118,6 +118,32 @@ def test_read_request_id_from_transcript_ignores_assistant_markers(tmp_path) -> 
     assert read_request_id_from_transcript(str(transcript)) == "real"
 
 
+def test_read_request_id_from_transcript_handles_channel_wrapper(tmp_path) -> None:
+    """Request ID is found even when the user message is wrapped in a <channel> tag.
+
+    When poor-claude injects a prompt via the MCP channel the user message content
+    is wrapped as:
+        <channel source="poor-claude" request_id="REQ_ID">
+        <poor-claude-request id="REQ_ID">...</poor-claude-request>
+        </channel>
+    The old regex anchored with \\A failed to match because the text starts with
+    <channel>, not <poor-claude-request>.
+    """
+    transcript = tmp_path / "session.jsonl"
+    content = (
+        '<channel source="poor-claude" request_id="ch-req-999">\n'
+        '<poor-claude-request id="ch-req-999">\n'
+        "hello world\n"
+        "</poor-claude-request>\n"
+        "</channel>"
+    )
+    transcript.write_text(
+        json.dumps({"message": {"role": "user", "content": content}}),
+        encoding="utf-8",
+    )
+    assert read_request_id_from_transcript(str(transcript)) == "ch-req-999"
+
+
 def test_read_last_assistant_message_ignores_malformed_lines(tmp_path) -> None:
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(

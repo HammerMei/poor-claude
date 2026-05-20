@@ -70,7 +70,7 @@ def read_request_id_from_transcript(transcript_path: str) -> str | None:
     path = Path(transcript_path)
     if not path.exists():
         return None
-    pattern = re.compile(r'\A\s*<poor-claude-request\s+id="([^"]+)">')
+    pattern = re.compile(r'<poor-claude-request\s+id="([^"]+)">')
     latest_request_id = None
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line:

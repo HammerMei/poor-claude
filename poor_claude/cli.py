@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--print", dest="print_prompt", nargs="?", const=True)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--session-id")
+    # --name is accepted for compatibility with ACG (agent-chat-gateway) which passes
+    # it as a session label/title.  claude-no-p does not use it but must not reject it.
+    parser.add_argument("--name")
     parser.add_argument("-r", "--resume", nargs="?", const=RESUME_PICKER_SENTINEL)
     parser.add_argument("--output-format", choices=["text", "json", "stream-json"], default="text")
     parser.add_argument("--verbose", action="store_true")

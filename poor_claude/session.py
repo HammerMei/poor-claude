@@ -285,6 +285,36 @@ class SessionRegistry:
         self.cancel_queued_requests_for_route(route=route)
         return request
 
+    def finish_and_cancel_queue_for_route(
+        self,
+        *,
+        route: str,
+        request_id: str | None,
+        response: str,
+        now: float | None = None,
+    ) -> PendingRequest:
+        """Complete the active request and immediately cancel any queued requests.
+
+        Used in the timeout+transcript path where the Claude process is about to
+        be killed: the active request gets a response (from the transcript), and
+        all queued requests are cancelled so their handler threads receive an error
+        immediately rather than waking up and calling ``route_prompt`` against a
+        dead route.
+
+        Equivalent to ``finish_request_for_route(promote=False)`` followed by
+        ``cancel_queued_requests_for_route``, but in a single call so callers
+        cannot forget the cancel step.
+        """
+        finished = self.finish_request_for_route(
+            route=route,
+            request_id=request_id,
+            response=response,
+            now=now,
+            promote=False,
+        )
+        self.cancel_queued_requests_for_route(route=route)
+        return finished
+
     def cancel_queued_requests_for_route(self, *, route: str) -> list[PendingRequest]:
         """Cancel and drain all queued (not yet active) requests for a route.
 

@@ -3029,8 +3029,18 @@ def test_queue_full_returns_429(tmp_path) -> None:
             t.start()
             time.sleep(0.05)  # stagger slightly so ordering is predictable
 
-        # Wait a moment for all threads to settle.
-        time.sleep(0.5)
+        # Poll until all MAX_PENDING_QUEUE_DEPTH + 1 requests have either queued or
+        # become active, so the overflow check below is not racing with enqueue.
+        wait_deadline = time.time() + 10
+        while time.time() < wait_deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions:
+                # active (1) + pending queue depth must equal MAX_PENDING_QUEUE_DEPTH
+                pending = sessions[0].get("pending_queue_depth", 0)
+                if pending >= MAX_PENDING_QUEUE_DEPTH:
+                    break
+            time.sleep(0.05)
 
         # Now try one more — should be rejected with 429.
         # HttpClientError message format: "POST <url> failed: <code> <body>"
@@ -3244,3 +3254,201 @@ def test_queued_request_cancelled_when_r1_completes_via_transcript_at_deadline(
 
     server.shutdown()
     server.server_close()
+
+
+def test_queued_request_timeout_starts_at_activation_not_enqueue(tmp_path) -> None:
+    """R2's timeout_seconds clock starts when R2 is activated, not when it was enqueued.
+
+    R1 takes 3 seconds.  R2 has timeout_seconds=2.  If timeout were measured from
+    enqueue time, R2 would time out before R1 finishes.  With activation-time semantics,
+    R2 has a full 2 seconds after R1 completes, so both requests must succeed.
+    """
+    server, address = start_test_server()
+    try:
+        r1_result: dict = {}
+        r2_result: dict = {}
+
+        def send_r1() -> None:
+            try:
+                r1_result["r1"] = request_json(
+                    "POST",
+                    f"{address}/requests",
+                    {
+                        "session_id": "demo",
+                        "workdir": str(tmp_path),
+                        "prompt": "prompt-r1",
+                        "timeout_seconds": 10,
+                        "wait_for_response": True,
+                    },
+                    timeout=15,
+                )
+            except Exception as exc:
+                r1_result["error"] = str(exc)
+
+        def send_r2() -> None:
+            try:
+                r2_result["r2"] = request_json(
+                    "POST",
+                    f"{address}/requests",
+                    {
+                        "session_id": "demo",
+                        "workdir": str(tmp_path),
+                        "prompt": "prompt-r2",
+                        # Shorter than R1's processing time — would time out if clock
+                        # started at enqueue rather than at activation.
+                        "timeout_seconds": 2,
+                        "wait_for_response": True,
+                    },
+                    timeout=15,
+                )
+            except Exception as exc:
+                r2_result["error"] = str(exc)
+
+        t1 = threading.Thread(target=send_r1, daemon=True)
+        t2 = threading.Thread(target=send_r2, daemon=True)
+        t1.start()
+
+        # Wait for R1 to become active.
+        wait_deadline = time.time() + 5
+        while time.time() < wait_deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            if listed.get("sessions") and listed["sessions"][0].get("active_request"):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("R1 never became active")
+
+        t2.start()
+        time.sleep(0.2)  # Let R2 enqueue; its timeout_seconds=2 clock has NOT started.
+
+        # Hold R1 for 3 seconds — longer than R2's timeout_seconds.
+        # If timeout starts at enqueue, R2 would expire here.
+        time.sleep(3)
+
+        # Complete R1 via Stop hook.
+        session_id = request_json("GET", f"{address}/sessions")["sessions"][0]["session_id"]
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "response-r1", "cwd": str(tmp_path)},
+        )
+        t1.join(timeout=5)
+
+        # R2 is now activated; its 2-second window starts NOW.  Complete it quickly.
+        wait_deadline = time.time() + 5
+        while time.time() < wait_deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            if listed["sessions"][0].get("active_request"):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("R2 never became active after R1 completed")
+
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "response-r2", "cwd": str(tmp_path)},
+        )
+        t2.join(timeout=5)
+
+        assert not t1.is_alive(), "R1 thread did not complete"
+        assert not t2.is_alive(), "R2 thread did not complete"
+        assert r1_result.get("r1", {}).get("response") == "response-r1", f"R1: {r1_result}"
+        assert r2_result.get("r2", {}).get("response") == "response-r2", (
+            f"R2 timed out or errored — timeout likely started at enqueue rather than "
+            f"activation; got: {r2_result}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_soft_restart_blocked_while_request_is_active(tmp_path) -> None:
+    """A launch_process=True request with updated soft params is rejected when another
+    request is already active, rather than killing the active request's process."""
+    server, address = start_test_server()
+    try:
+        # Create session with initial params and launch_process=True.
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {
+                "session_id": "demo",
+                "workdir": str(tmp_path),
+                "effort": "normal",
+            },
+        )
+
+        r1_result: dict = {}
+
+        def send_r1() -> None:
+            try:
+                r1_result["r1"] = request_json(
+                    "POST",
+                    f"{address}/requests",
+                    {
+                        "session_id": "demo",
+                        "workdir": str(tmp_path),
+                        "prompt": "prompt-r1",
+                        "timeout_seconds": 30,
+                        "wait_for_response": True,
+                    },
+                    timeout=35,
+                )
+            except Exception as exc:
+                r1_result["error"] = str(exc)
+
+        t1 = threading.Thread(target=send_r1, daemon=True)
+        t1.start()
+
+        # Wait for R1 to become active.
+        wait_deadline = time.time() + 5
+        while time.time() < wait_deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            if listed.get("sessions") and listed["sessions"][0].get("active_request"):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("R1 never became active")
+
+        # Send R2 with launch_process=True and different soft params — this must be
+        # rejected (400) rather than killing R1's process.
+        try:
+            request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "workdir": str(tmp_path),
+                    "prompt": "prompt-r2",
+                    "timeout_seconds": 5,
+                    "wait_for_response": True,
+                    "launch_process": True,
+                    "effort": "high",  # different from session's "normal"
+                },
+            )
+            raise AssertionError("Expected 400 error for restart-while-busy")
+        except HttpClientError as exc:
+            assert "400" in str(exc) or exc.payload is not None, f"Unexpected error: {exc}"
+            assert exc.payload is not None and "busy" in exc.payload.get("error", "").lower(), (
+                f"Expected 'busy' in error message; got: {exc.payload}"
+            )
+
+        # R1 must still be running (its process was NOT killed by R2).
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0].get("active_request") is not None, (
+            "R1 should still be active after R2's rejected restart attempt"
+        )
+
+        # Complete R1 normally.
+        session_id = listed["sessions"][0]["session_id"]
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "response-r1", "cwd": str(tmp_path)},
+        )
+        t1.join(timeout=5)
+        assert r1_result.get("r1", {}).get("response") == "response-r1", f"R1: {r1_result}"
+    finally:
+        server.shutdown()
+        server.server_close()

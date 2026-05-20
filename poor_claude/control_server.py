@@ -239,6 +239,10 @@ def _prune_sessions_locked(state: ControlState, *, now: float | None = None) -> 
             session.metadata["process_alive"] = "False"
         process_dead = session.metadata.get("process_alive") == "False"
         if session.active_request is None and (session.is_idle_expired(current) or process_dead):
+            # Defensive cancel: the queue invariant guarantees pending_request_queue
+            # is empty when active_request is None, but guard against future invariant
+            # breaks so waiting handler threads are never silently orphaned.
+            state.registry.cancel_queued_requests_for_route(route=route)
             if managed is not None:
                 session.metadata["process_stopping"] = "True"
                 session.metadata["process_alive"] = "False"
@@ -564,8 +568,6 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         return f"{intermediate}\n\n{final}"
                     return final
                 active = session.active_request
-                if active is None:
-                    return request.response or ""
                 if active is not None and active.request_id == request.request_id:
                     if response_from_transcript is None:
                         state.registry.timeout_request_for_route(
@@ -573,17 +575,14 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             request_id=request.request_id,
                         )
                     else:
-                        # promote=False: the process is about to be killed, so we must
-                        # NOT activate the next queued request — it would call route_prompt
-                        # against a dead route and hang until its own timeout.  Cancel the
-                        # queue explicitly instead so those handlers wake up immediately.
-                        state.registry.finish_request_for_route(
+                        # The process is about to be killed; finish R1 and cancel the
+                        # queue atomically so queued handlers wake up with an error
+                        # rather than calling route_prompt against a dead route.
+                        state.registry.finish_and_cancel_queue_for_route(
                             route=session.route_key,
                             request_id=request.request_id,
                             response=response_from_transcript,
-                            promote=False,
                         )
-                        state.registry.cancel_queued_requests_for_route(route=session.route_key)
                     session.metadata["process_stopping"] = "True"
                     session.metadata["process_alive"] = "False"
                     should_stop_process = True
@@ -696,6 +695,7 @@ def make_handler(state: ControlState):
                             "active_request": session.active_request.request_id
                             if session.active_request
                             else None,
+                            "pending_queue_depth": len(session.pending_request_queue),
                             "metadata": session.metadata,
                         }
                         for session in state.registry._sessions.values()
@@ -861,6 +861,18 @@ def make_handler(state: ControlState):
                     warnings = _apply_launch_metadata(session, payload)
                     _prepare_launch_metadata(state, session)
                     if bool(payload.get("launch_process", False)):
+                        # Guard: do not restart the process while another request is
+                        # active — that would kill R1 mid-flight.  Leave restart_needed
+                        # in metadata so the restart happens on the next launch_process=True
+                        # call after the session becomes idle.
+                        if (
+                            session.metadata.get("restart_needed") == "True"
+                            and session.active_request is not None
+                        ):
+                            raise RuntimeError(
+                                "session is busy; cannot restart process with updated params "
+                                "while a request is active — retry after the current request completes"
+                            )
                         _ensure_process_metadata(state, session)
                     try:
                         request, is_active = state.registry.enqueue_or_activate_request_for_route(
@@ -877,16 +889,33 @@ def make_handler(state: ControlState):
 
                 if not is_active:
                     # Another request is running — block until this one is promoted.
-                    # The activation_event is set by finish_request_for_route when
-                    # R1 completes, or with cancelled=True on shutdown/session-stop.
+                    # Poll with a bounded wait so we detect process death and daemon
+                    # shutdown even when activation_event is never explicitly set.
                     # Timeout does NOT start here; it starts after activation, so
                     # timeout_seconds measures only Claude's processing time.
-                    request.activation_event.wait()
+                    while not request.activation_event.wait(timeout=5.0):
+                        with state.lock:
+                            if state.shutdown_requested or state.shutdown_in_progress:
+                                state.registry.cancel_queued_requests_for_route(route=_route_key)
+                                break
+                            session_now = state.registry._sessions.get(_route_key)
+                            if session_now is None:
+                                break  # session removed; request.cancelled already set
+                            if session_now.metadata.get("process_alive") == "False":
+                                # Process died while we were waiting; wake everyone at once.
+                                state.registry.cancel_queued_requests_for_route(route=_route_key)
+                                break
                     if request.cancelled:
-                        raise RuntimeError("queued request was cancelled: daemon is shutting down or session was stopped")
+                        with state.lock:
+                            is_shutdown = state.shutdown_requested or state.shutdown_in_progress
+                        if is_shutdown:
+                            self._send_error(503, "daemon is shutting down; queued request cancelled")
+                            return
+                        raise RuntimeError("queued request was cancelled: session was stopped or process died")
                     with state.lock:
                         if state.shutdown_requested or state.shutdown_in_progress:
-                            raise RuntimeError("daemon is shutting down")
+                            self._send_error(503, "daemon is shutting down")
+                            return
                         if state.registry._sessions.get(_route_key) is None:
                             raise RuntimeError("session was stopped while request was queued")
 
@@ -1137,6 +1166,11 @@ def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
                 with state.lock:
                     state.shutdown_in_progress = True
                     state.shutdown_requested = True
+                    # Wake handler threads blocked on activation_event.wait() so
+                    # they can observe shutdown_requested and return a 503 error.
+                    # (Mirrors the POST /shutdown handler's cancel step.)
+                    for _session in state.registry._sessions.values():
+                        state.registry.cancel_queued_requests_for_route(route=_session.route_key)
                     state.condition.notify_all()
             if time.time() >= next_prune:
                 _prune_sessions(state)

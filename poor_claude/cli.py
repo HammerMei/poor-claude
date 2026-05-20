@@ -9,7 +9,7 @@ import sys
 import uuid
 
 from poor_claude.compat import stream_json_lines
-from poor_claude.config import resolve_ttl
+from poor_claude.config import resolve_timeout, resolve_ttl
 from poor_claude.daemon import default_state_path, discover_state, start_daemon
 from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.prompt import PromptError, resolve_prompt
@@ -22,7 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="claude-no-p")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("-p", "--print", dest="print_prompt", nargs="?", const=True)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=None,
+                        help="Request timeout in seconds (default: POOR_CLAUDE_TIMEOUT_SECONDS env var or 300)")
     parser.add_argument("--session-id")
     # --name is accepted for compatibility with ACG (agent-chat-gateway) which passes
     # it as a session label/title.  claude-no-p does not use it but must not reject it.
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             cli_ttl=args.ttl,
             keep_alive=args.keep_alive,
         )
+        timeout = resolve_timeout(cli_timeout=args.timeout)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -127,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             "output_format": args.output_format,
             "settings": args.settings,
             "auto_accept_startup_prompts": args.auto_accept_startup_prompts,
-            "timeout_seconds": args.timeout,
+            "timeout_seconds": timeout,
             "ttl_seconds": ttl.ttl_seconds,
             "keep_alive": ttl.keep_alive,
             "workdir": args.workdir,
@@ -218,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                 "auto_accept_workspace_trust": args.auto_accept_startup_prompts,
                 "wait_for_response": True,
                 "prompt": resolved.prompt if resolved else "",
-                "timeout_seconds": args.timeout,
+                "timeout_seconds": timeout,
                 "ttl_seconds": ttl.ttl_seconds,
                 "keep_alive": ttl.keep_alive,
                 "workdir": args.workdir,
@@ -230,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 "allowed_tools": args.allowed_tools or [],
                 "disallowed_tools": args.disallowed_tools or [],
             },
-            timeout=args.timeout + 5,
+            timeout=timeout + 5,
         )
         if args.debug:
             print(json.dumps(result, sort_keys=True), file=sys.stderr)

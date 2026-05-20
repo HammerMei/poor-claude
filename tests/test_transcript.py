@@ -2,7 +2,14 @@ import json
 from pathlib import Path
 
 import poor_claude.transcript as transcript_module
-from poor_claude.transcript import find_background_agent_ids_in_transcript, read_response_after_request_from_file, read_response_record_after_request_from_file, transcript_candidates
+from poor_claude.transcript import (
+    find_background_agent_ids_in_transcript,
+    find_background_task_ids_in_transcript,
+    find_completed_task_ids_in_transcript,
+    read_response_after_request_from_file,
+    read_response_record_after_request_from_file,
+    transcript_candidates,
+)
 
 
 def test_transcript_candidates_include_sanitized_workdir(tmp_path) -> None:
@@ -217,3 +224,268 @@ def test_read_response_after_request_ignores_unreadable_transcript(monkeypatch, 
 
     monkeypatch.setattr(transcript_module, "_read_recent_text", fail_read)
     assert read_response_after_request_from_file(transcript, request_id="req1") is None
+
+
+# ---------------------------------------------------------------------------
+# find_background_task_ids_in_transcript tests
+# ---------------------------------------------------------------------------
+
+def _make_bash_task_launch_event(request_id: str | None, task_id: str) -> dict:
+    """Simulate the tool_result user message when a Bash background task is launched."""
+    tool_result_text = (
+        f"Command running in background with ID: {task_id}. "
+        "Output is being written to: /tmp/tasks/output. "
+        "You will be notified when it completes."
+    )
+    content: list = []
+    if request_id is not None:
+        content.append({"type": "text", "text": f'<poor-claude-request id="{request_id}">'})
+    content.append({
+        "type": "tool_result",
+        "tool_use_id": "toolu_bash",
+        "content": [{"type": "text", "text": tool_result_text}],
+    })
+    return {"message": {"role": "user", "content": content}}
+
+
+def _make_task_notification_event(task_id: str, status: str) -> dict:
+    """Simulate the user message injected when a Bash background task finishes."""
+    content = (
+        f"<task-notification>\n"
+        f"<task-id>{task_id}</task-id>\n"
+        f"<tool-use-id>toolu_bash</tool-use-id>\n"
+        f"<output-file>/tmp/tasks/{task_id}.output</output-file>\n"
+        f"<status>{status}</status>\n"
+        f"<summary>Background command completed</summary>\n"
+        f"</task-notification>"
+    )
+    return {"message": {"role": "user", "content": content}}
+
+
+def test_find_background_task_ids_returns_id_after_request_marker(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps(_make_bash_task_launch_event("req1", "bp7l7f22b")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_background_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == ["bp7l7f22b"]
+
+
+def test_find_background_task_ids_ignores_before_request_marker(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps(_make_bash_task_launch_event(None, "boldtask1")),
+            json.dumps({"message": {"role": "user", "content": [
+                {"type": "text", "text": '<poor-claude-request id="req2">'},
+            ]}}),
+            json.dumps(_make_bash_task_launch_event(None, "bnewtask1")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_background_task_ids_in_transcript(transcript, request_id="req2")
+    assert ids == ["bnewtask1"]
+    assert "boldtask1" not in ids
+
+
+def test_find_background_task_ids_returns_multiple(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps(_make_bash_task_launch_event("req3", "btask1111")),
+            json.dumps(_make_bash_task_launch_event(None, "btask2222")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_background_task_ids_in_transcript(transcript, request_id="req3")
+    assert set(ids) == {"btask1111", "btask2222"}
+
+
+def test_find_background_task_ids_ignores_non_background_tool_results(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": [
+                {"type": "text", "text": '<poor-claude-request id="req4">'},
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "Command ran and exited with code 0."}]},
+            ]}}),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_background_task_ids_in_transcript(transcript, request_id="req4")
+    assert ids == []
+
+
+def test_find_background_task_ids_returns_empty_for_missing_file(tmp_path) -> None:
+    ids = find_background_task_ids_in_transcript(tmp_path / "nonexistent.jsonl", request_id="req1")
+    assert ids == []
+
+
+# ---------------------------------------------------------------------------
+# find_completed_task_ids_in_transcript tests
+# ---------------------------------------------------------------------------
+
+def test_find_completed_task_ids_returns_completed_status(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+            json.dumps(_make_task_notification_event("bp7l7f22b", "completed")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == ["bp7l7f22b"]
+
+
+def test_find_completed_task_ids_returns_killed_status(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+            json.dumps(_make_task_notification_event("bxx3ro3af", "killed")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == ["bxx3ro3af"]
+
+
+def test_find_completed_task_ids_returns_failed_status(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+            json.dumps(_make_task_notification_event("btask001", "failed")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == ["btask001"]
+
+
+def test_find_completed_task_ids_returns_stopped_status(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+            json.dumps(_make_task_notification_event("btask002", "stopped")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == ["btask002"]
+
+
+def test_find_completed_task_ids_ignores_running_status(tmp_path) -> None:
+    """'running' is a non-terminal status and must NOT be treated as completion."""
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+            json.dumps(_make_task_notification_event("btask003", "running")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req1")
+    assert ids == []
+
+
+def test_find_completed_task_ids_ignores_before_request_marker(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps(_make_task_notification_event("boldtask1", "completed")),
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req2">'}}),
+            json.dumps(_make_task_notification_event("bnewtask1", "completed")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req2")
+    assert ids == ["bnewtask1"]
+    assert "boldtask1" not in ids
+
+
+def test_find_completed_task_ids_returns_multiple(tmp_path) -> None:
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req3">'}}),
+            json.dumps(_make_task_notification_event("btask1111", "completed")),
+            json.dumps(_make_task_notification_event("btask2222", "killed")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req3")
+    assert set(ids) == {"btask1111", "btask2222"}
+
+
+def test_find_completed_task_ids_ignores_unknown_status(tmp_path) -> None:
+    """A status not in the whitelist (e.g. 'cancelled') must be silently ignored.
+
+    The whitelist design means an unrecognised status leaves the task in pending
+    (request waits until timeout) rather than completing prematurely.  This test
+    anchors that intended behaviour so future readers know the silent-ignore is
+    deliberate.
+    """
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req5">'}}),
+            json.dumps(_make_task_notification_event("btask5555", "cancelled")),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req5")
+    assert ids == [], "unknown status 'cancelled' should be ignored, not treated as terminal"
+
+
+def test_find_completed_task_ids_no_cross_block_leakage(tmp_path) -> None:
+    """Two <task-notification> blocks in a SINGLE user message must not cross-match.
+
+    A naive single regex can pick up task-id from block 1 and status from block 2.
+    The 3-part block-based approach must isolate each block so only the task whose
+    own block contains a terminal status is returned.
+
+    Layout:
+      block 1: task-id=btask3333, status=running   → must NOT be returned
+      block 2: task-id=btask4444, status=completed  → must be returned
+    """
+    two_blocks = (
+        "<task-notification>\n"
+        "<task-id>btask3333</task-id>\n"
+        "<tool-use-id>toolu_a</tool-use-id>\n"
+        "<output-file>/tmp/btask3333.out</output-file>\n"
+        "<status>running</status>\n"
+        "<summary>still running</summary>\n"
+        "</task-notification>\n"
+        "<task-notification>\n"
+        "<task-id>btask4444</task-id>\n"
+        "<tool-use-id>toolu_b</tool-use-id>\n"
+        "<output-file>/tmp/btask4444.out</output-file>\n"
+        "<status>completed</status>\n"
+        "<summary>done</summary>\n"
+        "</task-notification>"
+    )
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req4">'}}),
+            json.dumps({"message": {"role": "user", "content": two_blocks}}),
+        ]),
+        encoding="utf-8",
+    )
+    ids = find_completed_task_ids_in_transcript(transcript, request_id="req4")
+    assert ids == ["btask4444"], (
+        "btask3333 has status=running so it must not appear; "
+        "cross-block regex leakage would incorrectly include it"
+    )
+
+
+def test_find_completed_task_ids_returns_empty_for_missing_file(tmp_path) -> None:
+    ids = find_completed_task_ids_in_transcript(tmp_path / "nonexistent.jsonl", request_id="req1")
+    assert ids == []

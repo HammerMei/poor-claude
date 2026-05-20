@@ -10,11 +10,37 @@ AUTO_SESSION_TTL_SECONDS = 900
 NAMED_SESSION_TTL_SECONDS = 3600
 TTL_ENV_VAR = "POOR_CLAUDE_TTL_SECONDS"
 
+DEFAULT_TIMEOUT_SECONDS = 300
+TIMEOUT_ENV_VAR = "POOR_CLAUDE_TIMEOUT_SECONDS"
+
 
 @dataclass(frozen=True)
 class TtlConfig:
     ttl_seconds: int | None
     keep_alive: bool
+
+
+def resolve_timeout(
+    *,
+    cli_timeout: int | None,
+    environ: dict[str, str] | None = None,
+) -> int:
+    """Resolve effective timeout using documented precedence.
+
+    Priority: CLI flag > POOR_CLAUDE_TIMEOUT_SECONDS env var > DEFAULT_TIMEOUT_SECONDS.
+    """
+    if cli_timeout is not None:
+        return cli_timeout
+    env = os.environ if environ is None else environ
+    if TIMEOUT_ENV_VAR in env and env[TIMEOUT_ENV_VAR] != "":
+        try:
+            val = int(env[TIMEOUT_ENV_VAR])
+        except ValueError as exc:
+            raise ValueError(f"{TIMEOUT_ENV_VAR} must be an integer number of seconds") from exc
+        if val <= 0:
+            raise ValueError(f"{TIMEOUT_ENV_VAR} must be greater than 0")
+        return val
+    return DEFAULT_TIMEOUT_SECONDS
 
 
 def parse_ttl(value: str) -> int:

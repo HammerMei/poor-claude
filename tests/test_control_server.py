@@ -1198,6 +1198,93 @@ def test_control_server_timeout_clears_stopping_flag_when_termination_fails(tmp_
         server.server_close()
 
 
+def test_wait_for_response_timeout_prepends_intermediate_response(tmp_path, monkeypatch) -> None:
+    """On timeout with a transcript fallback, intermediate_response must be prepended.
+
+    Flow:
+      1. Transcript polling finds a background Bash task ("btask-001") → bg_work_detected=True,
+         intermediate_response set to "LAUNCHED" (the first stable transcript response).
+      2. Pending task keeps _wait_for_response looping.
+      3. Transcript then stabilises on "PARTIAL OUTPUT" → transcript_fallback_response.
+      4. Request times out (task never completes — no terminal <task-notification>).
+      5. Response must be "LAUNCHED\\n\\nPARTIAL OUTPUT", not just "PARTIAL OUTPUT".
+    """
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    read_calls: dict[str, int] = {"count": 0}
+    task_scan_calls: dict[str, int] = {"count": 0}
+
+    def fake_read_response(*_a, **_kw):
+        read_calls["count"] += 1
+        # First two polls → "LAUNCHED" (becomes stable, triggers bg-task scan).
+        # Subsequent polls → "PARTIAL OUTPUT" (different value → becomes new stable,
+        # is stored as transcript_fallback_response when timeout fires).
+        if read_calls["count"] <= 2:
+            return TranscriptResponse("LAUNCHED", stop_reason="end_turn")
+        return TranscriptResponse("PARTIAL OUTPUT", stop_reason="end_turn")
+
+    def fake_find_tasks(*_a, **_kw):
+        # First scan: report the task so bg_work_detected=True and intermediate_response
+        # is set.  Subsequent scans: return [] so pending never grows further.
+        task_scan_calls["count"] += 1
+        return ["btask-001"] if task_scan_calls["count"] == 1 else []
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        fake_read_response,
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_task_ids_in_transcript",
+        fake_find_tasks,
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_completed_task_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+
+    result_holder: dict[str, object] = {}
+
+    def run_request():
+        try:
+            result_holder["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "hello",
+                    "timeout_seconds": 3,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+            )
+        except Exception as exc:
+            result_holder["error"] = exc
+
+    req_thread = threading.Thread(target=run_request, daemon=True)
+    req_thread.start()
+    req_thread.join(timeout=8)
+
+    try:
+        assert "error" not in result_holder, f"request raised unexpectedly: {result_holder.get('error')}"
+        result = result_holder.get("result")
+        assert result is not None, "request thread did not complete"
+        assert result["response"] == "LAUNCHED\n\nPARTIAL OUTPUT", (
+            "timeout path must prepend intermediate_response to transcript fallback; "
+            f"got: {result['response']!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_delete_does_not_hold_state_lock_while_stopping_process(tmp_path) -> None:
     state = ControlState()
     fake_process = SlowFakeProcess()
@@ -2136,7 +2223,7 @@ def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_alrea
       2. Transcript polling stabilises on "LAUNCHED" (end_turn) after 0.5 s.
       3. Transcript scan finds "race-agent"; it's in completed_agent_ids → pending stays empty.
       4. Old code: pending=0 → finish("LAUNCHED") ← BUG
-         New code: bg_agent_detected=True, pending=0 → reset timer, keep looping.
+         New code: bg_work_detected=True, pending=0 → reset timer, keep looping.
       5. Second Stop hook fires with "BG-DONE" → finish_request_for_route → request done.
     """
     state = ControlState()
@@ -2197,11 +2284,11 @@ def test_wait_for_response_does_not_complete_from_transcript_when_bg_agent_alrea
         # window + a comfortable margin).  Old code would finish with "LAUNCHED" here.
         time.sleep(1.5)
 
-        # Request must still be active — bg_agent_detected guard prevents early finish.
+        # Request must still be active — bg_work_detected guard prevents early finish.
         listed = request_json("GET", f"{address}/sessions")
         assert listed["sessions"][0]["active_request"] is not None, (
             "request completed prematurely with stale 'LAUNCHED' response — "
-            "bg_agent_detected guard is not preventing early completion"
+            "bg_work_detected guard is not preventing early completion"
         )
 
         # Second Stop hook fires with the real final response.
@@ -2265,6 +2352,550 @@ def test_subagent_stop_adds_to_completed_agent_ids(tmp_path) -> None:
         )
         assert stop_r == {"ok": True}
         assert "deferred" not in stop_r
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Bash(run_in_background=True) task-tracking tests
+# ---------------------------------------------------------------------------
+
+def _write_bash_task_transcript(
+    path: Path,
+    request_id: str,
+    task_id: str,
+    *,
+    completed: bool = False,
+    completion_status: str = "completed",
+    premature_response: str = "TASK_RUNNING",
+    final_response: str | None = None,
+) -> None:
+    """Write a minimal transcript simulating a Bash background task launch.
+
+    If *completed* is True, also appends a ``<task-notification>`` user message
+    and optionally a final assistant response.
+    """
+    tool_result_text = (
+        f"Command running in background with ID: {task_id}. "
+        f"Output is being written to: /tmp/tasks/{task_id}.output. "
+        "You will be notified when it completes."
+    )
+    events = [
+        {"message": {"role": "user", "content": [
+            {"type": "text", "text": f'<poor-claude-request id="{request_id}">'},
+        ]}},
+        {"message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_bash", "name": "Bash",
+             "input": {"command": "sleep 5", "run_in_background": True}},
+        ]}},
+        {"message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bash",
+             "content": [{"type": "text", "text": tool_result_text}]},
+        ]}},
+        {"message": {"role": "assistant", "content": premature_response, "stop_reason": "end_turn"}},
+    ]
+    if completed:
+        notification = (
+            f"<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n"
+            f"<tool-use-id>toolu_bash</tool-use-id>\n"
+            f"<output-file>/tmp/tasks/{task_id}.output</output-file>\n"
+            f"<status>{completion_status}</status>\n"
+            f"<summary>Background command completed</summary>\n"
+            f"</task-notification>"
+        )
+        events.append({"message": {"role": "user", "content": notification}})
+        if final_response is not None:
+            events.append({"message": {
+                "role": "assistant",
+                "content": final_response,
+                "stop_reason": "end_turn",
+            }})
+    path.write_text("\n".join(_json.dumps(e) for e in events), encoding="utf-8")
+
+
+def test_stop_hook_defers_when_bash_task_pending(tmp_path) -> None:
+    """Stop hook must defer when a Bash background task is still running."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "run bg bash task",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+
+        # Transcript shows launch but no completion yet
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bash_task_transcript(transcript, request_id=request_id, task_id="btask0001")
+
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_RUNNING",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert stop_response.get("deferred") is True
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] == request_id
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stop_hook_completes_immediately_when_bash_task_already_done(tmp_path) -> None:
+    """If the transcript shows both launch AND a terminal task-notification, no defer."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "run fast bash task",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+
+        # Transcript shows launch AND completion in the same transcript
+        transcript = tmp_path / f"{session_id}.jsonl"
+        _write_bash_task_transcript(
+            transcript, request_id=request_id, task_id="btask0002",
+            completed=True, final_response="TASK_DONE",
+        )
+
+        stop_response = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert stop_response == {"ok": True}
+        assert "deferred" not in stop_response
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stop_hook_bash_task_deferred_then_completed_on_second_stop(tmp_path) -> None:
+    """Full lifecycle: first Stop defers (task running), second Stop completes (task done)."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "run bash task",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+        transcript = tmp_path / f"{session_id}.jsonl"
+
+        # First Stop: transcript shows launch only (task still running)
+        _write_bash_task_transcript(transcript, request_id=request_id, task_id="btask0003")
+        first_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_RUNNING",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert first_stop.get("deferred") is True
+
+        # Task completes — update transcript with notification + final response
+        _write_bash_task_transcript(
+            transcript, request_id=request_id, task_id="btask0003",
+            completed=True, final_response="TASK_DONE",
+        )
+
+        # Second Stop: transcript now shows completion
+        second_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert second_stop == {"ok": True}
+        assert "deferred" not in second_stop
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_bash_task_intermediate_response_prepended_to_final(tmp_path) -> None:
+    """_wait_for_response must return 'TASK_RUNNING\\n\\nTASK_DONE' for a Bash background task."""
+    server, address = start_test_server()
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "run bash task",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        request_id = listed["sessions"][0]["active_request"]
+        transcript = tmp_path / f"{session_id}.jsonl"
+
+        # First Stop: task still running
+        _write_bash_task_transcript(transcript, request_id=request_id, task_id="btask0004")
+        first_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_RUNNING",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert first_stop.get("deferred") is True
+
+        # Task completes — update transcript
+        _write_bash_task_transcript(
+            transcript, request_id=request_id, task_id="btask0004",
+            completed=True, final_response="TASK_DONE",
+        )
+
+        # Second Stop: task done
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_DONE",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+
+        req_thread.join(timeout=5)
+        assert not req_thread.is_alive(), "request thread did not finish"
+        assert result_box.get("result", {}).get("response") == "TASK_RUNNING\n\nTASK_DONE"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stop_hook_bash_task_killed_status_treated_as_terminal(tmp_path) -> None:
+    """'killed' status in task-notification must remove the task from pending (no defer)."""
+    server, address = start_test_server()
+    try:
+        queued = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "run killed bash task",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+            },
+        )
+        session_id = queued["session_id"]
+        request_id = queued["request_id"]
+        transcript = tmp_path / f"{session_id}.jsonl"
+
+        # First Stop defers — task is running
+        _write_bash_task_transcript(transcript, request_id=request_id, task_id="btask0005")
+        first_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_RUNNING",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert first_stop.get("deferred") is True
+
+        # Task is killed — transcript updated with 'killed' notification
+        _write_bash_task_transcript(
+            transcript, request_id=request_id, task_id="btask0005",
+            completed=True, completion_status="killed", final_response="TASK_KILLED",
+        )
+
+        # Second Stop: 'killed' is terminal → must complete, not defer
+        second_stop = request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "response": "TASK_KILLED",
+                "cwd": str(tmp_path),
+                "transcript_path": str(transcript),
+            },
+        )
+        assert second_stop == {"ok": True}
+        assert "deferred" not in second_stop
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_bash_task_not_missed_when_completion_only_in_first_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    """The _wait_for_response candidate loop must NOT stop when a candidate has only
+    find_completed results but no launch — it must continue scanning other candidates.
+
+    Scenario:
+      candidate A: find_tasks=[], find_completed=["btask8888"]  (stale notification, no launch)
+      candidate B: find_tasks=["btask8888"], find_completed=["btask8888"]
+
+    OLD (buggy) behaviour: break at A because found_completed is truthy →
+      newly_discovered_tasks=[] → bg_work_detected stays False → pending=0 →
+      finish_request_for_route("LAUNCHED") prematurely.
+
+    NEW (correct) behaviour: don't break at A (no launch) → continue to B →
+      find launch → add to pending → discard (completed) → net pending=0 →
+      bg_work_detected=True → elif branch → keep looping → Stop hook finishes.
+    """
+    candidate_a = tmp_path / "candidate_a.jsonl"
+    candidate_b = tmp_path / "candidate_b.jsonl"
+    candidate_a.write_text("", encoding="utf-8")
+    candidate_b.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.transcript_candidates",
+        lambda **_kw: [candidate_a, candidate_b],
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse("LAUNCHED", stop_reason="end_turn"),
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+
+    def fake_find_tasks(path, **_kw):
+        # Only candidate B has the launch.
+        return ["btask8888"] if path == candidate_b else []
+
+    def fake_find_completed(path, **_kw):
+        # Candidate A carries a stale completion with no corresponding launch.
+        # Candidate B also has the completion (same task).
+        return ["btask8888"] if path in (candidate_a, candidate_b) else []
+
+    monkeypatch.setattr("poor_claude.control_server.find_background_task_ids_in_transcript", fake_find_tasks)
+    monkeypatch.setattr("poor_claude.control_server.find_completed_task_ids_in_transcript", fake_find_completed)
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "run bash task",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Wait for the transcript scan to fire (>0.5 s quiet window + margin).
+        # With the OLD buggy break condition, the request would finish here with
+        # "LAUNCHED" because candidate A's completion-only result stops the loop.
+        time.sleep(1.5)
+
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is not None, (
+            "request completed prematurely — candidate loop broke early on "
+            "completion-only candidate A before scanning candidate B for the launch"
+        )
+
+        # Stop hook fires with the real final response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-DONE", "cwd": str(tmp_path)},
+        )
+
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "LAUNCHED\n\nBG-DONE"
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_bash_task_completed_before_scan(
+    tmp_path, monkeypatch
+) -> None:
+    """_wait_for_response must not complete with a premature response when a Bash task
+    was already done before the transcript scan fires.
+
+    This exercises the pure transcript-polling path (no Stop hooks / bypassPermissions).
+    The scan simultaneously finds task launch AND completion in the transcript:
+      1. find_background_task_ids → ["btasktest1"] (add to pending)
+      2. find_completed_task_ids → ["btasktest1"] (discard from pending)
+      3. Net result: pending=0, bg_work_detected=True → elif branch → keep looping.
+      4. Stop hook fires with real final response → finish.
+      5. response must be "LAUNCHED\\n\\nBG-DONE".
+    """
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse("LAUNCHED", stop_reason="end_turn"),
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_task_ids_in_transcript",
+        lambda *_a, **_kw: ["btasktest1"],
+    )
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_completed_task_ids_in_transcript",
+        lambda *_a, **_kw: ["btasktest1"],
+    )
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "run bash task",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active.
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Wait long enough for transcript polling (>0.5 s quiet window + comfortable margin).
+        # Old code without bg_work_detected guard would finish with "LAUNCHED" here.
+        time.sleep(1.5)
+
+        # Request must still be active — bg_work_detected prevents early finish even
+        # when pending is empty (task was launched and completed in the same scan window).
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is not None, (
+            "request completed prematurely with stale 'LAUNCHED' response — "
+            "bg_work_detected guard not working for Bash tasks"
+        )
+
+        # Stop hook fires with the real final response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-DONE", "cwd": str(tmp_path)},
+        )
+
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "LAUNCHED\n\nBG-DONE"
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["active_request"] is None
     finally:
         server.shutdown()
         server.server_close()

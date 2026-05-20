@@ -2,9 +2,12 @@ import pytest
 
 from poor_claude.config import (
     AUTO_SESSION_TTL_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
     NAMED_SESSION_TTL_SECONDS,
+    TIMEOUT_ENV_VAR,
     TTL_ENV_VAR,
     parse_ttl,
+    resolve_timeout,
     resolve_ttl,
 )
 
@@ -45,3 +48,25 @@ def test_resolve_ttl_defaults_by_session_type() -> None:
 def test_resolve_ttl_rejects_keep_alive_with_ttl() -> None:
     with pytest.raises(ValueError, match="cannot be used together"):
         resolve_ttl(session_id=None, cli_ttl="1", keep_alive=True, environ={})
+
+
+def test_resolve_timeout_uses_cli_first() -> None:
+    assert resolve_timeout(cli_timeout=120, environ={TIMEOUT_ENV_VAR: "9999"}) == 120
+
+
+def test_resolve_timeout_uses_env_before_default() -> None:
+    assert resolve_timeout(cli_timeout=None, environ={TIMEOUT_ENV_VAR: "600"}) == 600
+
+
+def test_resolve_timeout_falls_back_to_default() -> None:
+    assert resolve_timeout(cli_timeout=None, environ={}) == DEFAULT_TIMEOUT_SECONDS
+
+
+def test_resolve_timeout_rejects_non_integer_env() -> None:
+    with pytest.raises(ValueError, match="integer number of seconds"):
+        resolve_timeout(cli_timeout=None, environ={TIMEOUT_ENV_VAR: "abc"})
+
+
+def test_resolve_timeout_rejects_non_positive_env() -> None:
+    with pytest.raises(ValueError, match="greater than 0"):
+        resolve_timeout(cli_timeout=None, environ={TIMEOUT_ENV_VAR: "0"})

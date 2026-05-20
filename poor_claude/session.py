@@ -44,24 +44,47 @@ class SessionRecord:
     active_request: PendingRequest | None = None
     completed_request_ids: deque[str] = field(default_factory=lambda: deque(maxlen=256))
     metadata: dict[str, str] = field(default_factory=dict)
-    # Tracks background Agent tool calls that are still running.
+    # Tracks background work that is still in-flight for the active request.
     #
-    # Previously populated by the PostToolUse hook (which does not fire in
-    # bypassPermissions mode).  Now populated by the Stop hook handler and the
-    # transcript-polling loop via ``find_background_agent_ids_in_transcript`` —
-    # they scan the session transcript for "Async agent launched successfully"
-    # tool results and add newly discovered agentIds here.  Each entry is removed
-    # when the matching SubagentStop fires.  The Stop hook is deferred until this
-    # set is empty so we wait for all background agents to finish before signalling
-    # ACG.  Set semantics make stale SubagentStop calls (e.g. from sync agents)
-    # safe no-ops via discard().
+    # Holds two kinds of IDs that are managed identically but have different
+    # completion signals:
+    #
+    #   • Agent IDs (``Agent(run_in_background=True)``)
+    #     Discovered by the Stop hook / transcript-polling loop via
+    #     ``find_background_agent_ids_in_transcript``.  Removed when the
+    #     matching ``SubagentStop`` hook fires.
+    #
+    #   • Bash task IDs (``Bash(run_in_background=True)``)
+    #     Discovered by the same paths via ``find_background_task_ids_in_transcript``.
+    #     Removed when ``find_completed_task_ids_in_transcript`` finds a terminal
+    #     ``<task-notification>`` — there is no SubagentStop equivalent for Bash tasks.
+    #
+    # The Stop hook is deferred until this set is empty so we wait for all
+    # background work to finish before signalling ACG.  Set semantics make
+    # stale SubagentStop calls (e.g. from sync agents) safe no-ops via discard().
+    #
+    # ID-collision invariant: agent IDs match ``[A-Za-z0-9_-]+`` and Bash task
+    # IDs match ``[a-z0-9]+`` (observed format; verified against real transcripts).
+    # The task-ID regex only matches lowercase alphanumeric, so agent IDs that
+    # contain at least one uppercase letter or ``[-_]`` character cannot alias a
+    # task ID.  However, an all-lowercase-alphanumeric agent ID (e.g. "abc123")
+    # is indistinguishable from a task ID by format alone — a SubagentStop for
+    # such an agent would incorrectly discard a same-named pending Bash task and
+    # vice versa, causing silent under-counting and premature request completion.
+    # In practice Claude Code always generates agent IDs with uppercase letters or
+    # hyphens, so collisions have not been observed.  If Claude Code ever changes
+    # its agent-ID format, the sets should be split into separate agent and task
+    # ID tracking structures.
     pending_background_agent_ids: set = field(default_factory=set)
-    # Accumulates agentIds of background agents that have *completed* (SubagentStop
-    # fired) during the current request.  Used by the transcript-scan logic to avoid
-    # re-adding agents that already finished before we discovered them in the
-    # transcript — a SubagentStop that fires before the scan would otherwise cause
-    # an infinite defer loop.  Reset at the start of each new request alongside
-    # pending_background_agent_ids.
+    # Accumulates IDs of background work that has *completed* during the current
+    # request.  Used by the transcript-scan logic to avoid re-adding items that
+    # already finished before the scan ran:
+    #   • For Agent tasks: populated when SubagentStop fires.
+    #   • For Bash tasks: populated when find_completed_task_ids_in_transcript
+    #     discovers a terminal <task-notification>.
+    # A SubagentStop / completion scan that fires before the transcript scan would
+    # otherwise cause an infinite defer loop.  Reset at the start of each new
+    # request alongside pending_background_agent_ids.
     completed_agent_ids: set = field(default_factory=set)
 
     def is_idle_expired(self, now: float | None = None) -> bool:

@@ -3113,7 +3113,13 @@ def test_queued_requests_cancelled_on_session_stop(tmp_path) -> None:
             time.sleep(0.05)
 
         t2.start()
-        time.sleep(0.2)  # Let R2 queue up.
+        # Poll until R2 appears in the queue — more reliable than a fixed sleep.
+        wait_deadline = time.time() + 5
+        while time.time() < wait_deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            if listed.get("sessions") and listed["sessions"][0].get("pending_queue_depth", 0) > 0:
+                break
+            time.sleep(0.05)
 
         # Stop the session — should cancel R2 (and cause R1 to error since the
         # session route is removed mid-wait).
@@ -3184,10 +3190,13 @@ def test_queued_request_cancelled_when_r1_completes_via_transcript_at_deadline(
                     "session_id": "demo",
                     "workdir": str(tmp_path),
                     "prompt": "prompt-r1",
-                    "timeout_seconds": 2,
+                    # timeout_seconds=4: gives at least 2 s of margin after the
+                    # transcript stabilises (>0.5 s quiet window) for the deadline to
+                    # fire on even a heavily loaded CI machine.
+                    "timeout_seconds": 4,
                     "wait_for_response": True,
                 },
-                timeout=10,
+                timeout=12,
             )
         except Exception as exc:
             r1_result["error"] = str(exc)
@@ -3225,16 +3234,22 @@ def test_queued_request_cancelled_when_r1_completes_via_transcript_at_deadline(
         raise AssertionError("R1 never became active")
 
     t2.start()
-    time.sleep(0.2)  # Let R2 enqueue.
+    # Poll until R2 is in the queue — more reliable than a fixed sleep on slow CI.
+    wait_deadline = time.time() + 5
+    while time.time() < wait_deadline:
+        listed = request_json("GET", f"{address}/sessions")
+        if listed.get("sessions") and listed["sessions"][0].get("pending_queue_depth", 0) > 0:
+            break
+        time.sleep(0.05)
 
     # Enable the transcript response.  It must stabilise for 0.5 s before R1's
-    # 2-second deadline; enabling it at ~t=0.2 gives ~1.3 s of lead time.
+    # 4-second deadline.  Enabling here gives ~3 s of lead time on any machine.
     transcript_enabled.set()
 
-    # R1 deadline fires at ~t=2 s.  With the fix, R2 is cancelled immediately.
+    # R1 deadline fires at ~t=4 s.  With the fix, R2 is cancelled immediately.
     # Both threads must finish well within the test timeout.
-    t1.join(timeout=8)
-    t2.join(timeout=4)  # R2 must NOT hang until its 30-second timeout
+    t1.join(timeout=12)
+    t2.join(timeout=6)  # R2 must NOT hang until its 30-second timeout
 
     assert not t1.is_alive(), "R1 thread did not complete in time"
     assert not t2.is_alive(), (

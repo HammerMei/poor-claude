@@ -242,6 +242,11 @@ def _prune_sessions_locked(state: ControlState, *, now: float | None = None) -> 
             # Defensive cancel: the queue invariant guarantees pending_request_queue
             # is empty when active_request is None, but guard against future invariant
             # breaks so waiting handler threads are never silently orphaned.
+            # Notify coverage: queued handler threads wait on activation_event, not
+            # the condition variable, so they do not need condition.notify_all() here.
+            # The notify at the end of _prune_sessions_locked (for removed routes) and
+            # the stop() finally block (for stopping routes) cover any _wait_for_response
+            # waiters on the condition.
             state.registry.cancel_queued_requests_for_route(route=route)
             if managed is not None:
                 session.metadata["process_stopping"] = "True"
@@ -402,10 +407,12 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     )
                     state.condition.notify_all()
                 raise RuntimeError("daemon is shutting down")
-            # Check completion by request_id rather than by `active is None` so
-            # that a queued request promoted to active (which makes active_request
-            # non-None again) does not prevent this request's waiter from returning.
-            if request.request_id in session.completed_request_ids:
+            # Use request.response is not None as the primary completion signal.
+            # request is a direct reference to the PendingRequest object, so this
+            # check cannot be "evicted" the way completed_request_ids (maxlen=256)
+            # could be in a long-lived session with hundreds of completed requests.
+            # completed_request_ids is kept as a belt-and-suspenders fallback only.
+            if request.response is not None or request.request_id in session.completed_request_ids:
                 final = request.response or ""
                 intermediate = request.intermediate_response
                 if intermediate and intermediate != final:
@@ -561,7 +568,8 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     raise RuntimeError("session route no longer exists")
                 # If our request completed (e.g. promoted queue brought active_request
                 # to a different request), return immediately instead of timing out.
-                if request.request_id in session.completed_request_ids:
+                # Primary: request.response is not None (eviction-safe object field).
+                if request.response is not None or request.request_id in session.completed_request_ids:
                     final = request.response or ""
                     intermediate = request.intermediate_response
                     if intermediate and intermediate != final:
@@ -867,13 +875,21 @@ def make_handler(state: ControlState):
                         # call after the session becomes idle.
                         if (
                             session.metadata.get("restart_needed") == "True"
-                            and session.active_request is not None
+                            and (session.active_request is not None or session.pending_request_queue)
                         ):
                             raise RuntimeError(
                                 "session is busy; cannot restart process with updated params "
-                                "while a request is active — retry after the current request completes"
+                                "while a request is active - retry after the current request completes"
                             )
                         _ensure_process_metadata(state, session)
+                    # Reject fire-and-forget requests when the session is busy:
+                    # the caller expects an immediate 202, not a silent queue wait.
+                    if not wait_for_response and session.active_request is not None:
+                        raise RuntimeError(
+                            "session is busy; fire-and-forget requests cannot be queued "
+                            "- use wait_for_response=True or retry after the active request completes"
+                        )
+                    _too_many_error: str | None = None
                     try:
                         request, is_active = state.registry.enqueue_or_activate_request_for_route(
                             route=session.route_key,
@@ -881,11 +897,18 @@ def make_handler(state: ControlState):
                             timeout_seconds=timeout_seconds,
                         )
                     except TooManyRequestsError as exc:
-                        self._send_error(429, str(exc))
-                        return
-                    _route_key = session.route_key
-                    _session_id_for_prompt = session.session_id
-                    _request_id = request.request_id
+                        # Capture the message; send the 429 OUTSIDE the lock to avoid
+                        # blocking other handler threads during the socket write.
+                        _too_many_error = str(exc)
+                    else:
+                        _route_key = session.route_key
+                        _session_id_for_prompt = session.session_id
+                        _request_id = request.request_id
+
+                # Send 429 outside the lock so other threads are not blocked.
+                if _too_many_error is not None:
+                    self._send_error(429, _too_many_error)
+                    return
 
                 if not is_active:
                     # Another request is running — block until this one is promoted.

@@ -21,7 +21,7 @@ from poor_claude.launcher import build_claude_command, cleanup_project_mcp_confi
 from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
 from poor_claude.settings import cleanup_project_local_settings
-from poor_claude.session import SessionRegistry
+from poor_claude.session import SessionRegistry, TooManyRequestsError
 from poor_claude.transcript import (
     find_background_agent_ids_in_transcript,
     find_background_task_ids_in_transcript,
@@ -398,7 +398,10 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     )
                     state.condition.notify_all()
                 raise RuntimeError("daemon is shutting down")
-            if active is None:
+            # Check completion by request_id rather than by `active is None` so
+            # that a queued request promoted to active (which makes active_request
+            # non-None again) does not prevent this request's waiter from returning.
+            if request.request_id in session.completed_request_ids:
                 final = request.response or ""
                 intermediate = request.intermediate_response
                 if intermediate and intermediate != final:
@@ -552,6 +555,14 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
             with state.lock:
                 if state.registry._sessions.get(session.route_key) is not session:
                     raise RuntimeError("session route no longer exists")
+                # If our request completed (e.g. promoted queue brought active_request
+                # to a different request), return immediately instead of timing out.
+                if request.request_id in session.completed_request_ids:
+                    final = request.response or ""
+                    intermediate = request.intermediate_response
+                    if intermediate and intermediate != final:
+                        return f"{intermediate}\n\n{final}"
+                    return final
                 active = session.active_request
                 if active is None:
                     return request.response or ""
@@ -562,11 +573,17 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             request_id=request.request_id,
                         )
                     else:
+                        # promote=False: the process is about to be killed, so we must
+                        # NOT activate the next queued request — it would call route_prompt
+                        # against a dead route and hang until its own timeout.  Cancel the
+                        # queue explicitly instead so those handlers wake up immediately.
                         state.registry.finish_request_for_route(
                             route=session.route_key,
                             request_id=request.request_id,
                             response=response_from_transcript,
-                    )
+                            promote=False,
+                        )
+                        state.registry.cancel_queued_requests_for_route(route=session.route_key)
                     session.metadata["process_stopping"] = "True"
                     session.metadata["process_alive"] = "False"
                     should_stop_process = True
@@ -720,6 +737,10 @@ def make_handler(state: ControlState):
                 with state.lock:
                     state.shutdown_requested = True
                     state.shutdown_in_progress = False
+                    # Wake handler threads blocked on activation_event.wait() so
+                    # they can observe shutdown_requested and return an error.
+                    for session in state.registry._sessions.values():
+                        state.registry.cancel_queued_requests_for_route(route=session.route_key)
                     state.condition.notify_all()
                 response = {"ok": True}
                 self._send_json(200, response)
@@ -801,6 +822,10 @@ def make_handler(state: ControlState):
                     self._send_error(400, f"failed to stop process: {exc}")
                     return
             with state.lock:
+                # Cancel queued requests before removing the session so handler
+                # threads waiting on activation_event.wait() receive a cancellation
+                # signal and can return an error to their callers.
+                state.registry.cancel_queued_requests_for_route(route=existing.route_key)
                 state.registry._sessions.pop(existing.route_key, None)
                 state.mcp_router.remove_route(existing.route_key)
                 if _should_cleanup_project_settings_locked(state, existing.workdir):
@@ -837,14 +862,34 @@ def make_handler(state: ControlState):
                     _prepare_launch_metadata(state, session)
                     if bool(payload.get("launch_process", False)):
                         _ensure_process_metadata(state, session)
-                    request = state.registry.start_request_for_route(
-                        route=session.route_key,
-                        prompt=str(prompt),
-                        timeout_seconds=timeout_seconds,
-                    )
+                    try:
+                        request, is_active = state.registry.enqueue_or_activate_request_for_route(
+                            route=session.route_key,
+                            prompt=str(prompt),
+                            timeout_seconds=timeout_seconds,
+                        )
+                    except TooManyRequestsError as exc:
+                        self._send_error(429, str(exc))
+                        return
                     _route_key = session.route_key
                     _session_id_for_prompt = session.session_id
                     _request_id = request.request_id
+
+                if not is_active:
+                    # Another request is running — block until this one is promoted.
+                    # The activation_event is set by finish_request_for_route when
+                    # R1 completes, or with cancelled=True on shutdown/session-stop.
+                    # Timeout does NOT start here; it starts after activation, so
+                    # timeout_seconds measures only Claude's processing time.
+                    request.activation_event.wait()
+                    if request.cancelled:
+                        raise RuntimeError("queued request was cancelled: daemon is shutting down or session was stopped")
+                    with state.lock:
+                        if state.shutdown_requested or state.shutdown_in_progress:
+                            raise RuntimeError("daemon is shutting down")
+                        if state.registry._sessions.get(_route_key) is None:
+                            raise RuntimeError("session was stopped while request was queued")
+
                 # Release the lock before the async MCP call so other threads
                 # (e.g. the Stop hook handler) are not blocked while we wait.
                 notification = asyncio.run(
@@ -856,7 +901,9 @@ def make_handler(state: ControlState):
                     )
                 )
                 if wait_for_response:
-                    response = _wait_for_response(state, session, request, timeout_seconds=timeout_seconds)
+                    # Pass request.timeout_seconds so the deadline starts from
+                    # activation time (after route_prompt), not from enqueue time.
+                    response = _wait_for_response(state, session, request, timeout_seconds=request.timeout_seconds)
                     resp_body: dict[str, Any] = {
                         "request_id": request.request_id,
                         "session_id": session.session_id,

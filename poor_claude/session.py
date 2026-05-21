@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Maximum number of requests that may wait in a session's queue.
+# Requests beyond this limit are rejected with TooManyRequestsError.
+# Override with the POOR_CLAUDE_MAX_QUEUE_DEPTH environment variable.
+MAX_PENDING_QUEUE_DEPTH: int = int(os.environ.get("POOR_CLAUDE_MAX_QUEUE_DEPTH", "10"))
+
+
+class TooManyRequestsError(RuntimeError):
+    """Raised when a session's pending request queue is full.
+
+    The caller should surface this as HTTP 429 so the client can back off and retry.
+    """
 
 
 def canonical_project_dir(path: str) -> str:
@@ -29,6 +43,15 @@ class PendingRequest:
     # _wait_for_response (when it detects a background agent in the transcript).
     # Prepended to the final response so callers see the full turn history.
     intermediate_response: str | None = None
+    # Set when this request is promoted from the pending queue to active status.
+    # Handler threads wait on this event before calling route_prompt so that
+    # the response timeout starts at the moment Claude begins processing —
+    # not while the request is waiting in queue behind another request.
+    activation_event: threading.Event = field(default_factory=threading.Event)
+    # Set to True when the request is cancelled before it could be activated
+    # (e.g. daemon shutdown, session stop, or previous-request timeout).
+    # The handler thread checks this flag after activation_event fires.
+    cancelled: bool = False
 
 
 @dataclass
@@ -43,6 +66,12 @@ class SessionRecord:
     last_request_finished_at: float | None = None
     active_request: PendingRequest | None = None
     completed_request_ids: deque[str] = field(default_factory=lambda: deque(maxlen=256))
+    # FIFO queue of requests waiting to become active.  A plain deque (no maxlen)
+    # so we can check the depth and reject with TooManyRequestsError rather than
+    # silently dropping.  The invariant is: pending_request_queue is non-empty
+    # only when active_request is not None (a new request is always promoted
+    # immediately if the session is idle).
+    pending_request_queue: deque[PendingRequest] = field(default_factory=deque)
     metadata: dict[str, str] = field(default_factory=dict)
     # Tracks background work that is still in-flight for the active request.
     #
@@ -88,6 +117,9 @@ class SessionRecord:
     completed_agent_ids: set = field(default_factory=set)
 
     def is_idle_expired(self, now: float | None = None) -> bool:
+        # pending_request_queue is non-empty only when active_request is not None
+        # (invariant enforced by enqueue_or_activate_request_for_route), so the
+        # active_request check below is sufficient to cover both cases.
         if self.keep_alive or self.ttl_seconds is None or self.active_request is not None:
             return False
         reference = self.last_request_finished_at or self.created_at
@@ -129,65 +161,72 @@ class SessionRegistry:
         self._sessions[resolved_route_key] = record
         return record
 
-    def start_request(
-        self,
-        *,
-        session_id: str,
-        prompt: str,
-        timeout_seconds: int,
-        now: float | None = None,
-    ) -> PendingRequest:
-        matches = [session for session in self._sessions.values() if session.session_id == session_id]
-        if len(matches) != 1:
-            raise RuntimeError("session lookup by session_id is ambiguous; use start_request_for_route")
-        record = matches[0]
-        return self.start_request_for_route(
-            route=record.route_key,
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-            now=now,
-        )
-
-    def start_request_for_route(
+    def enqueue_or_activate_request_for_route(
         self,
         *,
         route: str,
         prompt: str,
         timeout_seconds: int,
         now: float | None = None,
-    ) -> PendingRequest:
+    ) -> tuple[PendingRequest, bool]:
+        """Create a request and either activate it immediately or enqueue it.
+
+        Returns ``(request, is_active_immediately)``.
+
+        - ``is_active_immediately=True``: the session was idle; the request is
+          now the active request and ``request.activation_event`` is already set.
+          The caller should proceed to ``route_prompt`` without waiting.
+
+        - ``is_active_immediately=False``: another request is running; the new
+          request has been appended to ``pending_request_queue``.  The caller
+          must block on ``request.activation_event`` and check ``request.cancelled``
+          before calling ``route_prompt``.
+
+        Raises ``TooManyRequestsError`` if the queue depth would exceed
+        ``MAX_PENDING_QUEUE_DEPTH``.
+
+        Timeout semantics: ``timeout_seconds`` is stored on the request but the
+        clock does *not* start until the request is activated.  The handler thread
+        is responsible for passing ``request.timeout_seconds`` to
+        ``_wait_for_response`` after activation so the deadline is measured from
+        the moment Claude starts processing, not from enqueue time.
+        """
         record = self._sessions[route]
-        if record.active_request is not None:
-            raise RuntimeError(f"request already in progress for route {route}")
         request = PendingRequest(
             request_id=uuid.uuid4().hex,
             prompt=prompt,
             created_at=time.time() if now is None else now,
             timeout_seconds=timeout_seconds,
         )
-        record.active_request = request
-        record.pending_background_agent_ids = set()
-        record.completed_agent_ids = set()
-        return request
+        if record.active_request is None:
+            # Session is idle — activate immediately.
+            record.active_request = request
+            record.pending_background_agent_ids = set()
+            record.completed_agent_ids = set()
+            request.activation_event.set()
+            return request, True
+        # Another request is already active — queue this one.
+        if len(record.pending_request_queue) >= MAX_PENDING_QUEUE_DEPTH:
+            raise TooManyRequestsError(
+                f"session queue is full ({MAX_PENDING_QUEUE_DEPTH} requests pending); "
+                "retry after the current request completes"
+            )
+        record.pending_request_queue.append(request)
+        return request, False
 
-    def finish_request(
-        self,
-        *,
-        session_id: str,
-        request_id: str | None,
-        response: str,
-        now: float | None = None,
-    ) -> PendingRequest:
-        matches = [session for session in self._sessions.values() if session.session_id == session_id]
-        if len(matches) != 1:
-            raise RuntimeError("session lookup by session_id is ambiguous; use finish_request_for_route")
-        record = matches[0]
-        return self.finish_request_for_route(
-            route=record.route_key,
-            request_id=request_id,
-            response=response,
-            now=now,
-        )
+    def _promote_next_queued_request(self, record: SessionRecord, now: float | None) -> None:
+        """Promote the oldest queued request to active status.
+
+        Must be called under the caller's lock with ``record.active_request`` already
+        cleared.  Sets the promoted request's ``activation_event`` so the handler
+        thread unblocks and proceeds to ``route_prompt``.
+        """
+        if record.pending_request_queue:
+            next_req = record.pending_request_queue.popleft()
+            record.active_request = next_req
+            record.pending_background_agent_ids = set()
+            record.completed_agent_ids = set()
+            next_req.activation_event.set()
 
     def finish_request_for_route(
         self,
@@ -196,7 +235,18 @@ class SessionRegistry:
         request_id: str | None,
         response: str,
         now: float | None = None,
+        promote: bool = True,
     ) -> PendingRequest:
+        """Mark the active request complete and optionally promote the next queued one.
+
+        ``promote=True`` (the default) immediately activates the next queued request so
+        the session can continue processing without delay.
+
+        ``promote=False`` leaves queued requests untouched.  Use this when the session
+        is about to lose its process (e.g. timeout path with a transcript fallback) so
+        that callers can cancel the queue themselves rather than waking a handler thread
+        that would call ``route_prompt`` against a dead route.
+        """
         record = self._sessions[route]
         request = record.active_request
         if request is None:
@@ -207,6 +257,8 @@ class SessionRegistry:
         record.active_request = None
         record.completed_request_ids.append(request.request_id)
         record.last_request_finished_at = time.time() if now is None else now
+        if promote:
+            self._promote_next_queued_request(record, now)
         return request
 
     def timeout_request_for_route(
@@ -216,6 +268,13 @@ class SessionRegistry:
         request_id: str,
         now: float | None = None,
     ) -> PendingRequest:
+        """Mark the active request as timed-out and cancel any queued requests.
+
+        On timeout the Claude process is killed; queued requests cannot be served
+        until the session restarts.  Rather than holding them in limbo, cancel them
+        immediately so callers receive an error and can retry (which will trigger a
+        process restart on the next enqueue_or_activate_request_for_route call).
+        """
         record = self._sessions[route]
         request = record.active_request
         if request is None:
@@ -225,7 +284,55 @@ class SessionRegistry:
         record.active_request = None
         record.completed_request_ids.append(request.request_id)
         record.last_request_finished_at = time.time() if now is None else now
+        self.cancel_queued_requests_for_route(route=route)
         return request
+
+    def finish_and_cancel_queue_for_route(
+        self,
+        *,
+        route: str,
+        request_id: str | None,
+        response: str,
+        now: float | None = None,
+    ) -> PendingRequest:
+        """Complete the active request and immediately cancel any queued requests.
+
+        Used in the timeout+transcript path where the Claude process is about to
+        be killed: the active request gets a response (from the transcript), and
+        all queued requests are cancelled so their handler threads receive an error
+        immediately rather than waking up and calling ``route_prompt`` against a
+        dead route.
+
+        Equivalent to ``finish_request_for_route(promote=False)`` followed by
+        ``cancel_queued_requests_for_route``, but in a single call so callers
+        cannot forget the cancel step.
+        """
+        finished = self.finish_request_for_route(
+            route=route,
+            request_id=request_id,
+            response=response,
+            now=now,
+            promote=False,
+        )
+        self.cancel_queued_requests_for_route(route=route)
+        return finished
+
+    def cancel_queued_requests_for_route(self, *, route: str) -> list[PendingRequest]:
+        """Cancel and drain all queued (not yet active) requests for a route.
+
+        Sets ``cancelled=True`` and fires ``activation_event`` on each request so
+        that handler threads blocking on ``activation_event.wait()`` wake up and
+        return an error to their callers.
+
+        Returns the list of cancelled requests (may be empty).
+        """
+        record = self._sessions[route]
+        cancelled = list(record.pending_request_queue)
+        record.pending_request_queue.clear()
+        for req in cancelled:
+            req.cancelled = True
+            req.activation_event.set()
+        return cancelled
 
     def expired_idle_sessions(self, *, now: float | None = None) -> list[SessionRecord]:
         return [session for session in self._sessions.values() if session.is_idle_expired(now)]

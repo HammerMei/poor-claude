@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -11,7 +12,8 @@ from pathlib import Path
 
 # Maximum number of requests that may wait in a session's queue.
 # Requests beyond this limit are rejected with TooManyRequestsError.
-MAX_PENDING_QUEUE_DEPTH: int = 10
+# Override with the POOR_CLAUDE_MAX_QUEUE_DEPTH environment variable.
+MAX_PENDING_QUEUE_DEPTH: int = int(os.environ.get("POOR_CLAUDE_MAX_QUEUE_DEPTH", "10"))
 
 
 class TooManyRequestsError(RuntimeError):

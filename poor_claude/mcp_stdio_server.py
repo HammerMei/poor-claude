@@ -66,6 +66,15 @@ def maybe_start_channel_poller(*, lock: threading.Lock, started: threading.Event
 
 def _poll_channel_notifications(control_url: str, route_key: str, lock: threading.Lock) -> None:
     url = f"{control_url}/mcp/next?route_key={quote(route_key, safe='')}"
+    # Delay before first poll to give Claude Code time to fully initialise its
+    # channel-notification handler after the MCP handshake.  Without this pause a
+    # notification sent within ~20ms of notifications/initialized is silently dropped
+    # by Claude Code (observed with v2.1.150+).  Configurable via
+    # POOR_CLAUDE_CHANNEL_INIT_DELAY (seconds, default 3.0; set to 0 to disable).
+    _init_delay = float(os.environ.get("POOR_CLAUDE_CHANNEL_INIT_DELAY", "3.0"))
+    if _init_delay > 0:
+        log_event({"event": "channel_poller_init_delay", "seconds": _init_delay})
+        time.sleep(_init_delay)
     while True:
         try:
             with urlopen(url, timeout=2) as response:  # noqa: S310 - localhost POC daemon

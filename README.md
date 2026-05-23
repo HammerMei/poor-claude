@@ -4,6 +4,13 @@
   <img src="docs/mascot.png" alt="poor-claude mascot" width="360">
 </p>
 
+<p align="center">
+  <a href="https://github.com/HammerMei/poor-claude/stargazers"><img src="https://img.shields.io/github/stars/HammerMei/poor-claude?style=flat&color=yellow" alt="Stars"></a>
+  <a href="https://github.com/HammerMei/poor-claude/releases/latest"><img src="https://img.shields.io/github/v/release/HammerMei/poor-claude?style=flat&color=blue" alt="Latest Release"></a>
+  <a href="https://github.com/HammerMei/poor-claude/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HammerMei/poor-claude?style=flat" alt="License"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.9%2B-blue?style=flat" alt="Python 3.9+"></a>
+</p>
+
 A drop-in replacement for `claude -p` (headless mode) that routes prompts through
 **persistent interactive Claude Code sessions** instead of spawning a new subprocess
 per call — keeping your usage under a Claude subscription rather than billing as API

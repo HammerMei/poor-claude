@@ -242,11 +242,15 @@ two things can't be verified without reproducing a real hang on your box:
    distinguish a hang from a legitimately quiet **foreground** tool call (a slow
    `Bash` test/build/install). If `POOR_CLAUDE_STALL_SECONDS` is shorter than such a
    call, the watchdog acts on a healthy turn. (Background agents are already guarded.)
-   Set the window **above your longest expected quiet period** and **well below the
-   request timeout** (`POOR_CLAUDE_TIMEOUT_SECONDS`, default 300) — leave room for all
-   the nudges *plus* a restart, roughly `stall < timeout / (MAX_NUDGES + 2)`. With the
-   defaults (timeout 300, `MAX_NUDGES` 3) a 120s stall never reaches the restart: ~2
-   nudges fire and the hard timeout kills at 300s first.
+   A false **nudge** is mildly polluting; a false **restart** is dangerous — it kills a
+   healthy in-flight process and can put a long task into a kill→re-run→kill loop. So
+   size the window **above your longest expected quiet period** (with margin) and **well
+   below the request timeout** — leave room for all the nudges *plus* a restart, roughly
+   `stall < timeout / (MAX_NUDGES + 2)`. If the caller uses a long timeout (e.g. ACG's
+   ~1800s), start around `POOR_CLAUDE_STALL_SECONDS=600`–`900`, not a small value.
+
+See [`VALIDATION.md`](VALIDATION.md) for the full step-by-step validation guide and
+sizing rules.
 
 Note that **restart is not a "proven" path** — it just carries a *different* unverified
 assumption than nudge: that a resumed Claude actually picks up the re-injected prompt

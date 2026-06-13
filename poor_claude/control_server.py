@@ -421,7 +421,17 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # the stall window above your agents' longest expected quiet period.  The
     # window must also be < the request timeout, or the kill path fires first.
     stall_seconds = float(os.environ.get("POOR_CLAUDE_STALL_SECONDS", "0"))
+    # What to do on a detected stall:
+    #   off                 - nothing (rely on the hard timeout/kill path)
+    #   nudge               - send nudge messages only
+    #   restart             - kill + `claude --resume` + re-inject, no nudge
+    #   nudge_then_restart  - nudge up to MAX_NUDGES, then escalate to one restart
+    # Nudging is cheap and preserves the turn but may be inert if Claude's loop is
+    # fully wedged; restart is heavier but almost always recovers.  The ladder
+    # covers both a soft SSE stall and a hard process wedge with one config.
+    stall_action = os.environ.get("POOR_CLAUDE_STALL_ACTION", "nudge_then_restart")
     max_nudges = int(os.environ.get("POOR_CLAUDE_MAX_NUDGES", "3"))
+    max_restarts = int(os.environ.get("POOR_CLAUDE_MAX_RESTARTS", "1"))
     nudge_prompt = os.environ.get(
         "POOR_CLAUDE_NUDGE_PROMPT",
         "Please continue your previous response.",
@@ -429,6 +439,7 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     last_activity_at = time.time()
     last_total_size = sum(transcript_offsets.values())
     nudges_sent = 0
+    restarts_done = 0
     # --------------------------------------------------------------------------
     next_candidate_refresh = time.time() + 2.0
     while True:
@@ -596,8 +607,8 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         transcript_offsets[str(candidate)] = 0
             next_candidate_refresh = time.time() + 2.0
 
-        # --- no-response watchdog: nudge a stalled Claude before timing out ---
-        if stall_seconds > 0:
+        # --- no-response watchdog: recover a stalled Claude before timing out ---
+        if stall_seconds > 0 and stall_action != "off":
             current_total_size = 0
             for candidate in candidates:
                 try:
@@ -606,6 +617,8 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     pass
             if current_total_size != last_total_size:
                 # Transcript grew → Claude is making progress; reset the watchdog.
+                # (Nudge budget refills for a fresh stall; restart budget does not,
+                # so a wedged session can't trigger an unbounded restart loop.)
                 last_total_size = current_total_size
                 last_activity_at = time.time()
                 nudges_sent = 0
@@ -613,30 +626,65 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                 request.response is None
                 and not session.pending_background_agent_ids
                 and time.time() - last_activity_at >= stall_seconds
-                and nudges_sent < max_nudges
             ):
                 # No transcript growth for the whole stall window, the request is
                 # still open, and no background agent/task is in flight: Claude is
-                # likely hung on a stalled SSE stream rather than legitimately
-                # waiting on background work (whose quiet main transcript would
-                # otherwise look identical to a hang).
-                # Send a nudge to wake it (anthropics/claude-code#26224 workaround).
-                nudges_sent += 1
-                last_activity_at = time.time()  # wait another window before re-nudging
-                with state.lock:
-                    session.metadata["nudges_sent"] = str(nudges_sent)
-                    session.metadata["last_nudge_at"] = str(time.time())
-                try:
-                    asyncio.run(
-                        state.mcp_router.route_prompt(
-                            route_key=session.route_key,
-                            session_id=session.session_id,
-                            request_id=request.request_id,
-                            prompt=nudge_prompt,
+                # likely hung (a stalled SSE stream — anthropics/claude-code#26224)
+                # rather than legitimately waiting on background work (whose quiet
+                # main transcript would otherwise look identical to a hang).
+                want_nudge = stall_action in ("nudge", "nudge_then_restart") and nudges_sent < max_nudges
+                want_restart = stall_action in ("restart", "nudge_then_restart") and restarts_done < max_restarts
+                if want_nudge:
+                    # Cheap first: a message reportedly revives a stuck SSE stream.
+                    nudges_sent += 1
+                    last_activity_at = time.time()  # wait another window before re-nudging
+                    with state.lock:
+                        session.metadata["nudges_sent"] = str(nudges_sent)
+                        session.metadata["last_nudge_at"] = str(time.time())
+                    try:
+                        asyncio.run(
+                            state.mcp_router.route_prompt(
+                                route_key=session.route_key,
+                                session_id=session.session_id,
+                                request_id=request.request_id,
+                                prompt=nudge_prompt,
+                            )
                         )
-                    )
-                except Exception:  # noqa: BLE001 - best-effort; deadline/kill path backstops
-                    pass
+                    except Exception:  # noqa: BLE001 - best-effort; restart/kill backstops
+                        pass
+                elif want_restart:
+                    # Nudging exhausted or disabled and the process is still wedged:
+                    # kill it and relaunch with `--resume` (conversation preserved via
+                    # resume_on_launch -> spec.resume), then re-inject the stuck prompt
+                    # so the resumed session processes it.  Reuses the tested
+                    # _ensure_process_metadata relaunch path.
+                    restarts_done += 1
+                    last_activity_at = time.time()
+                    nudges_sent = 0
+                    with state.lock:
+                        if state.registry._sessions.get(session.route_key) is not session:
+                            raise RuntimeError("session route no longer exists")
+                        session.metadata["restart_needed"] = "True"
+                        session.metadata["resume_on_launch"] = "True"
+                        session.metadata["stall_restarts"] = str(restarts_done)
+                        session.metadata["last_restart_at"] = str(time.time())
+                        state.mcp_router.clear_route(session.route_key)
+                        try:
+                            _ensure_process_metadata(state, session)
+                        except Exception:  # noqa: BLE001 - best-effort; kill path backstops
+                            pass
+                        state.condition.notify_all()
+                    try:
+                        asyncio.run(
+                            state.mcp_router.route_prompt(
+                                route_key=session.route_key,
+                                session_id=session.session_id,
+                                request_id=request.request_id,
+                                prompt=str(request.prompt),
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 - best-effort; kill path backstops
+                        pass
 
         remaining = deadline - time.time()
         if remaining <= 0:

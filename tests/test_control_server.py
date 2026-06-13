@@ -3481,6 +3481,7 @@ def test_wait_for_response_nudges_stalled_claude(tmp_path, monkeypatch) -> None:
         lambda *_a, **_kw: None,
     )
     monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "nudge")
     monkeypatch.setenv("POOR_CLAUDE_MAX_NUDGES", "2")
 
     state = ControlState()
@@ -3681,6 +3682,86 @@ def test_wait_for_response_watchdog_skips_nudge_during_background_work(tmp_path,
         )
         req_thread.join(timeout=3)
         assert result_box.get("result", {}).get("response") == "BG-FINAL"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_restart_fallback_relaunches_with_resume(tmp_path, monkeypatch) -> None:
+    """When stall_action escalates to a restart, the watchdog must kill+relaunch the
+    session with resume (resume_on_launch=True) and re-inject the stuck prompt,
+    reusing the _ensure_process_metadata relaunch path.  Then a Stop hook completes
+    the request normally.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    # Stub the relaunch so the test never spawns a real `claude` process.
+    recorded = {"ensure": 0}
+
+    def fake_ensure(state, session) -> None:
+        recorded["ensure"] += 1
+        session.metadata["process_alive"] = "True"
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        restarts = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                restarts = sessions[0]["metadata"].get("stall_restarts")
+                if restarts == "1":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert restarts == "1", f"watchdog did not escalate to a restart: {restarts}"
+        assert recorded["ensure"] >= 1, "relaunch path (_ensure_process_metadata) not invoked"
+
+        listed = request_json("GET", f"{address}/sessions")
+        meta = listed["sessions"][0]["metadata"]
+        assert meta.get("resume_on_launch") == "True", "relaunch did not request --resume"
+
+        # Resumed Claude finally responds; the Stop hook completes the request.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "RESUMED-OK", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "RESUMED-OK"
     finally:
         server.shutdown()
         server.server_close()

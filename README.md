@@ -209,6 +209,36 @@ These can be set in your shell profile or systemd/launchd service to tune defaul
 | `POOR_CLAUDE_TIMEOUT_SECONDS` | Default request timeout (seconds). CLI `--timeout` takes priority. | `300` |
 | `POOR_CLAUDE_TTL_SECONDS` | Default session TTL (seconds). CLI `--ttl` takes priority. | `900` (auto) / `3600` (named) |
 | `POOR_CLAUDE_STATE` | Path to the daemon state file. | `~/.poor-claude/daemon.json` |
+| `POOR_CLAUDE_STALL_SECONDS` | No-response watchdog (see below). If the transcript stops growing for this many seconds while a request is open, nudge Claude to recover from a stalled SSE stream ([claude-code#26224](https://github.com/anthropics/claude-code/issues/26224)). `0` disables. | `0` (disabled) |
+| `POOR_CLAUDE_MAX_NUDGES` | Max nudge attempts per stall before falling through to the hard timeout/kill path. | `3` |
+| `POOR_CLAUDE_NUDGE_PROMPT` | Text sent as the nudge message. | `Please continue your previous response.` |
+
+### No-response watchdog (experimental, default off)
+
+Claude Code can hang mid-turn waiting on an SSE stream that never delivers, at any
+point in a session ([#26224](https://github.com/anthropics/claude-code/issues/26224),
+[#57103](https://github.com/anthropics/claude-code/issues/57103)). It then writes
+nothing more and never fires its Stop hook, so a request sits idle until the hard
+timeout kills the process. The watchdog detects a stalled transcript and sends a
+nudge message (the reported workaround for reviving a stuck SSE) before giving up.
+
+**It ships disabled because two things can't be verified without reproducing a real
+hang on your box:**
+
+1. **Efficacy** — whether a channel-notification nudge actually wakes a Claude hung
+   on SSE is Claude Code's internal behaviour. Confirm it before relying on this.
+2. **False positives** — stall detection keys off transcript byte growth and cannot
+   distinguish a hang from a legitimately quiet **foreground** tool call (a slow
+   `Bash` test/build/install). If `POOR_CLAUDE_STALL_SECONDS` is shorter than such a
+   call, the watchdog injects a nudge into a healthy turn. (Background agents are
+   already guarded.) Set the window **above your longest expected quiet period** and
+   **below the request timeout** (`POOR_CLAUDE_TIMEOUT_SECONDS`, default 300) — with a
+   300s timeout and a 120s stall only ~2 nudges fit before the kill path fires.
+
+**Validation recipe:** set `POOR_CLAUDE_STALL_SECONDS` to a low value, reproduce a
+hang, then check the daemon for the `nudges_sent`/`last_nudge_at` session metadata
+*and* whether Claude actually resumed. If nudging proves inert, prefer kill +
+`--resume` on stall instead.
 
 ## Architecture notes
 

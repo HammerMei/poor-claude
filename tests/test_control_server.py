@@ -3467,3 +3467,220 @@ def test_soft_restart_blocked_while_request_is_active(tmp_path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_wait_for_response_nudges_stalled_claude(tmp_path, monkeypatch) -> None:
+    """No-response watchdog: when the transcript stops growing and no Stop hook
+    arrives (Claude hung on a stalled SSE stream), _wait_for_response should send
+    up to POOR_CLAUDE_MAX_NUDGES nudge notifications before falling through to the
+    hard-timeout/kill path.  See anthropics/claude-code#26224.
+    """
+    # No transcript file exists, so byte-size never grows → a stall is detected.
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_NUDGES", "2")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the watchdog to reach the nudge cap (2).
+        session_id = None
+        nudges = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                nudges = sessions[0]["metadata"].get("nudges_sent")
+                if nudges == "2":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert nudges == "2", f"watchdog did not send the expected nudges: {nudges}"
+
+        # Claude finally wakes and the Stop hook delivers the real response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "WOKE-UP", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "WOKE-UP"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_watchdog_disabled_when_stall_zero(tmp_path, monkeypatch) -> None:
+    """POOR_CLAUDE_STALL_SECONDS=0 disables the watchdog: no nudges are sent and
+    the normal Stop-hook completion path is undisturbed.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Give the loop time to run several iterations; with the watchdog disabled
+        # no nudges must be recorded.
+        time.sleep(1.0)
+        listed = request_json("GET", f"{address}/sessions")
+        assert "nudges_sent" not in listed["sessions"][0]["metadata"]
+
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "DONE", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "DONE"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_watchdog_skips_nudge_during_background_work(tmp_path, monkeypatch) -> None:
+    """The watchdog must NOT nudge while a background agent is in flight: the main
+    transcript is legitimately quiet then (the turn already ended with a launch),
+    which is not a hang.  Nudging there would disrupt real background work.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    # Stop hook / transcript scans must not discover or clear agents on their own.
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "1.0")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_NUDGES", "3")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "launch bg agent",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Become active, then register an in-flight background agent well within
+        # the first stall window (1.0s) so no nudge can fire first.
+        session_id = None
+        for _ in range(20):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.02)
+        assert session_id is not None, "request never became active"
+        request_json(
+            "POST",
+            f"{address}/hook/agent-launched",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "bg-1"},
+        )
+
+        # Wait past the stall window: with a pending background agent, no nudge.
+        time.sleep(1.6)
+        listed = request_json("GET", f"{address}/sessions")
+        assert "nudges_sent" not in listed["sessions"][0]["metadata"], (
+            "watchdog nudged during legitimate background work"
+        )
+
+        # Background agent finishes and the final Stop hook completes the request.
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "bg-1"},
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-FINAL", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "BG-FINAL"
+    finally:
+        server.shutdown()
+        server.server_close()

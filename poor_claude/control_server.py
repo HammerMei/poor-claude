@@ -393,6 +393,43 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # pending_background_agent_ids is empty but we still need to wait for the
     # second Stop hook to fire with the real final response.
     bg_work_detected = False
+    # --- no-response watchdog -------------------------------------------------
+    # Claude Code can hang mid-turn waiting on an SSE stream from Anthropic that
+    # never delivers (observed any time during a session, not just at startup;
+    # see anthropics/claude-code#26224, #57103).  When that happens Claude writes
+    # nothing more to the transcript and never fires its Stop hook, so this loop
+    # would otherwise sit idle until the hard timeout and kill the process.
+    #
+    # The reported workaround is that sending another message (even a single
+    # character) restarts the stalled SSE connection.  So before giving up we
+    # detect a stall (no transcript growth for POOR_CLAUDE_STALL_SECONDS) and
+    # send up to POOR_CLAUDE_MAX_NUDGES nudge notifications to wake Claude up.
+    # If nudging doesn't help, the existing deadline/kill path still backstops.
+    #
+    # NOTE: stall detection keys off transcript byte growth, which cannot tell a
+    # genuine hang apart from a legitimately long quiet *foreground* tool call —
+    # a slow `Bash` test/build/install that writes nothing until it returns looks
+    # identical to a hang.  If the stall window is shorter than such a call the
+    # watchdog will inject a nudge into a live, healthy turn.  (Background agents
+    # are guarded against below via pending_background_agent_ids; foreground waits
+    # have no such signal.)
+    #
+    # Because the nudge's *efficacy* (does a channel notification actually wake a
+    # Claude hung on SSE?) is Claude-Code-internal behaviour we cannot verify from
+    # here, the watchdog ships **disabled by default** (POOR_CLAUDE_STALL_SECONDS=0).
+    # Enable it only after validating on a box where the hang reproduces, and set
+    # the stall window above your agents' longest expected quiet period.  The
+    # window must also be < the request timeout, or the kill path fires first.
+    stall_seconds = float(os.environ.get("POOR_CLAUDE_STALL_SECONDS", "0"))
+    max_nudges = int(os.environ.get("POOR_CLAUDE_MAX_NUDGES", "3"))
+    nudge_prompt = os.environ.get(
+        "POOR_CLAUDE_NUDGE_PROMPT",
+        "Please continue your previous response.",
+    )
+    last_activity_at = time.time()
+    last_total_size = sum(transcript_offsets.values())
+    nudges_sent = 0
+    # --------------------------------------------------------------------------
     next_candidate_refresh = time.time() + 2.0
     while True:
         with state.lock:
@@ -558,6 +595,48 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     except OSError:
                         transcript_offsets[str(candidate)] = 0
             next_candidate_refresh = time.time() + 2.0
+
+        # --- no-response watchdog: nudge a stalled Claude before timing out ---
+        if stall_seconds > 0:
+            current_total_size = 0
+            for candidate in candidates:
+                try:
+                    current_total_size += candidate.stat().st_size
+                except OSError:
+                    pass
+            if current_total_size != last_total_size:
+                # Transcript grew → Claude is making progress; reset the watchdog.
+                last_total_size = current_total_size
+                last_activity_at = time.time()
+                nudges_sent = 0
+            elif (
+                request.response is None
+                and not session.pending_background_agent_ids
+                and time.time() - last_activity_at >= stall_seconds
+                and nudges_sent < max_nudges
+            ):
+                # No transcript growth for the whole stall window, the request is
+                # still open, and no background agent/task is in flight: Claude is
+                # likely hung on a stalled SSE stream rather than legitimately
+                # waiting on background work (whose quiet main transcript would
+                # otherwise look identical to a hang).
+                # Send a nudge to wake it (anthropics/claude-code#26224 workaround).
+                nudges_sent += 1
+                last_activity_at = time.time()  # wait another window before re-nudging
+                with state.lock:
+                    session.metadata["nudges_sent"] = str(nudges_sent)
+                    session.metadata["last_nudge_at"] = str(time.time())
+                try:
+                    asyncio.run(
+                        state.mcp_router.route_prompt(
+                            route_key=session.route_key,
+                            session_id=session.session_id,
+                            request_id=request.request_id,
+                            prompt=nudge_prompt,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - best-effort; deadline/kill path backstops
+                    pass
 
         remaining = deadline - time.time()
         if remaining <= 0:

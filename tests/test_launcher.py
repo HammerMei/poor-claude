@@ -4,7 +4,7 @@ import json
 import subprocess
 
 import poor_claude.launcher as launcher
-from poor_claude.launcher import ClaudeLaunchSpec, _startup_acceptance_keys, build_claude_command, prepare_launch_spec
+from poor_claude.launcher import ClaudeLaunchSpec, _startup_acceptance_keys, _rate_limit_acceptance_keys, build_claude_command, prepare_launch_spec
 from poor_claude.session import SessionRegistry
 
 
@@ -393,6 +393,69 @@ def test_drain_pty_to_log_bypass_permissions_prompt_not_handled_via_keys(tmp_pat
     monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
     launcher._drain_pty_to_log(9, log_path, auto_accept_startup_prompts=True)
     assert writes == []
+
+
+def test_rate_limit_acceptance_keys_detects_prompt() -> None:
+    """_rate_limit_acceptance_keys returns Enter for the /rate-limit-options TUI."""
+    plain = "/rate-limit-options 1. stop and wait for limit to reset"
+    keys, name = _rate_limit_acceptance_keys(plain)
+    assert keys == [b"\r"]
+    assert name == "rate-limit-options"
+
+
+def test_rate_limit_acceptance_keys_no_match_without_marker() -> None:
+    """Does not fire when /rate-limit-options is absent."""
+    keys, name = _rate_limit_acceptance_keys("some other output stop and wait for limit to reset")
+    assert keys is None
+    assert name is None
+
+
+def test_rate_limit_acceptance_keys_does_not_repeat(tmp_path) -> None:
+    """Once accepted, the same prompt does not trigger a second keypress."""
+    plain = "/rate-limit-options 1. stop and wait for limit to reset"
+    keys, name = _rate_limit_acceptance_keys(plain, {"rate-limit-options"})
+    assert keys is None
+    assert name is None
+
+
+def test_drain_pty_to_log_auto_dismisses_rate_limit_tui(tmp_path, monkeypatch) -> None:
+    """The rate-limit TUI is auto-dismissed with Enter even after startup acceptance ends."""
+    log_path = tmp_path / "pty.log"
+    writes = []
+    # Simulate: startup phase done, then rate-limit TUI appears mid-session.
+    chunks = iter(
+        [
+            b"listening for channel messages",  # ends startup phase
+            b"\n/rate-limit-options\n\xe2\x9d\xaf 1. Stop and wait for limit to reset\n",
+            b"",
+        ]
+    )
+
+    monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
+    monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    launcher._drain_pty_to_log(9, log_path, auto_accept_startup_prompts=True)
+
+    assert writes == [(9, b"\r")], f"expected single Enter keypress, got: {writes}"
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "auto-accept: rate-limit-options" in log_text
+
+
+def test_drain_pty_to_log_rate_limit_not_sent_twice(tmp_path, monkeypatch) -> None:
+    """Rate-limit Enter is sent at most once per session even if the TUI text appears twice."""
+    log_path = tmp_path / "pty.log"
+    writes = []
+    rate_limit_chunk = b"/rate-limit-options\n1. Stop and wait for limit to reset\n"
+    chunks = iter([rate_limit_chunk, rate_limit_chunk, b""])
+
+    monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
+    monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    launcher._drain_pty_to_log(9, log_path)
+
+    assert writes == [(9, b"\r")], f"expected exactly one Enter, got: {writes}"
 
 
 def test_prepare_launch_spec_calls_ensure_skip_prompt_when_auto_accept_enabled(tmp_path, monkeypatch) -> None:

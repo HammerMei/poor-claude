@@ -341,24 +341,61 @@ def _drain_pty_to_log(master_fd: int, log_path: Path | None, auto_accept_startup
                 return
             handle.write(chunk)
             handle.flush()
+            # Always track recent output for prompt detection (both startup and
+            # always-on prompts such as the rate-limit TUI).
+            recent = (recent + chunk.decode("utf-8", errors="ignore"))[-12000:]
+            plain_recent = _plain_terminal_text(recent)
             if auto_accept_startup_prompts:
-                recent = (recent + chunk.decode("utf-8", errors="ignore"))[-12000:]
-                plain_recent = _plain_terminal_text(recent)
                 if time.monotonic() > startup_deadline or "listening for channel messages" in plain_recent:
                     auto_accept_startup_prompts = False
-                    continue
-                key_chunks, prompt_name = _startup_acceptance_keys(recent, accepted)
-                if key_chunks is not None and prompt_name is not None:
-                    try:
-                        handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
-                        handle.flush()
-                        for i, key_chunk in enumerate(key_chunks):
-                            if i > 0:
-                                time.sleep(0.05)
-                            os.write(master_fd, key_chunk)
-                        accepted.add(prompt_name)
-                    except OSError:
-                        return
+                else:
+                    key_chunks, prompt_name = _startup_acceptance_keys(recent, accepted)
+                    if key_chunks is not None and prompt_name is not None:
+                        try:
+                            handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
+                            handle.flush()
+                            for i, key_chunk in enumerate(key_chunks):
+                                if i > 0:
+                                    time.sleep(0.05)
+                                os.write(master_fd, key_chunk)
+                            accepted.add(prompt_name)
+                        except OSError:
+                            return
+            # Always-on: auto-dismiss the rate-limit TUI whenever it appears.
+            key_chunks, prompt_name = _rate_limit_acceptance_keys(plain_recent, accepted)
+            if key_chunks is not None and prompt_name is not None:
+                try:
+                    handle.write(f"\n[poor-claude auto-accept: {prompt_name}]\n".encode("utf-8"))
+                    handle.flush()
+                    for i, key_chunk in enumerate(key_chunks):
+                        if i > 0:
+                            time.sleep(0.05)
+                        os.write(master_fd, key_chunk)
+                    accepted.add(prompt_name)
+                except OSError:
+                    return
+
+
+def _rate_limit_acceptance_keys(plain_text: str, accepted: set[str] | None = None) -> tuple[list[bytes] | None, str | None]:
+    """Detect and auto-dismiss the /rate-limit-options interactive TUI.
+
+    Claude Code shows this blocking prompt when the org hits its monthly spend
+    limit.  In headless/PTY mode there is no human to press Enter, so poor-claude
+    auto-selects option 1 ("Stop and wait for limit to reset") the moment the
+    prompt appears.  Claude then exits gracefully with a --resume hint rather
+    than blocking until the hard timeout kills it.
+
+    The `accepted` guard prevents sending Enter more than once per session.
+    """
+    accepted = accepted or set()
+    if (
+        "/rate-limit-options" in plain_text
+        and "stop and wait for limit to reset" in plain_text
+        and "rate-limit-options" not in accepted
+    ):
+        # Option 1 is already highlighted by default; confirm with Enter.
+        return [b"\r"], "rate-limit-options"
+    return None, None
 
 
 def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) -> tuple[list[bytes] | None, str | None]:

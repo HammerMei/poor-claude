@@ -3467,3 +3467,466 @@ def test_soft_restart_blocked_while_request_is_active(tmp_path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_wait_for_response_nudges_stalled_claude(tmp_path, monkeypatch) -> None:
+    """No-response watchdog: when the transcript stops growing and no Stop hook
+    arrives (Claude hung on a stalled SSE stream), _wait_for_response should send
+    up to POOR_CLAUDE_MAX_NUDGES nudge notifications before falling through to the
+    hard-timeout/kill path.  See anthropics/claude-code#26224.
+    """
+    # No transcript file exists, so byte-size never grows → a stall is detected.
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "nudge")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_NUDGES", "2")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the watchdog to reach the nudge cap (2).
+        session_id = None
+        nudges = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                nudges = sessions[0]["metadata"].get("nudges_sent")
+                if nudges == "2":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert nudges == "2", f"watchdog did not send the expected nudges: {nudges}"
+
+        # Claude finally wakes and the Stop hook delivers the real response.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "WOKE-UP", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "WOKE-UP"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_watchdog_disabled_when_stall_zero(tmp_path, monkeypatch) -> None:
+    """POOR_CLAUDE_STALL_SECONDS=0 disables the watchdog: no nudges are sent and
+    the normal Stop-hook completion path is undisturbed.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Give the loop time to run several iterations; with the watchdog disabled
+        # no nudges must be recorded.
+        time.sleep(1.0)
+        listed = request_json("GET", f"{address}/sessions")
+        assert "nudges_sent" not in listed["sessions"][0]["metadata"]
+
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "DONE", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "DONE"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_watchdog_skips_nudge_during_background_work(tmp_path, monkeypatch) -> None:
+    """The watchdog must NOT nudge while a background agent is in flight: the main
+    transcript is legitimately quiet then (the turn already ended with a launch),
+    which is not a hang.  Nudging there would disrupt real background work.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    # Stop hook / transcript scans must not discover or clear agents on their own.
+    monkeypatch.setattr(
+        "poor_claude.control_server.find_background_agent_ids_in_transcript",
+        lambda *_a, **_kw: [],
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "1.0")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_NUDGES", "3")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "launch bg agent",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Become active, then register an in-flight background agent well within
+        # the first stall window (1.0s) so no nudge can fire first.
+        session_id = None
+        for _ in range(20):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.02)
+        assert session_id is not None, "request never became active"
+        request_json(
+            "POST",
+            f"{address}/hook/agent-launched",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "bg-1"},
+        )
+
+        # Wait past the stall window: with a pending background agent, no nudge.
+        time.sleep(1.6)
+        listed = request_json("GET", f"{address}/sessions")
+        assert "nudges_sent" not in listed["sessions"][0]["metadata"], (
+            "watchdog nudged during legitimate background work"
+        )
+
+        # Background agent finishes and the final Stop hook completes the request.
+        request_json(
+            "POST",
+            f"{address}/hook/subagent-stop",
+            {"session_id": session_id, "cwd": str(tmp_path), "agent_id": "bg-1"},
+        )
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "BG-FINAL", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "BG-FINAL"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_restart_fallback_relaunches_with_resume(tmp_path, monkeypatch) -> None:
+    """When stall_action escalates to a restart, the watchdog must kill+relaunch the
+    session with resume (resume_on_launch=True) and re-inject the stuck prompt,
+    reusing the _ensure_process_metadata relaunch path.  Then a Stop hook completes
+    the request normally.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    # Stub the relaunch so the test never spawns a real `claude` process.
+    recorded = {"ensure": 0}
+
+    def fake_ensure(state, session) -> None:
+        recorded["ensure"] += 1
+        session.metadata["process_alive"] = "True"
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        restarts = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                restarts = sessions[0]["metadata"].get("stall_restarts")
+                if restarts == "1":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert restarts == "1", f"watchdog did not escalate to a restart: {restarts}"
+        assert recorded["ensure"] >= 1, "relaunch path (_ensure_process_metadata) not invoked"
+
+        listed = request_json("GET", f"{address}/sessions")
+        meta = listed["sessions"][0]["metadata"]
+        assert meta.get("resume_on_launch") == "True", "relaunch did not request --resume"
+
+        # Resumed Claude finally responds; the Stop hook completes the request.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "RESUMED-OK", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+        assert result_box.get("result", {}).get("response") == "RESUMED-OK"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_restart_aborts_when_request_completes_concurrently(tmp_path, monkeypatch) -> None:
+    """H2 (TOCTOU): when the Stop hook completes the request at the same time as
+    the watchdog decides to restart, the restart must be a no-op — no process kill,
+    restarts_done unchanged, response returned correctly.
+
+    This test simulates the race by delivering the Stop hook from inside
+    fake_ensure_process_metadata, which runs just after the re-check under the lock
+    has confirmed `do_restart=True`.  A second scenario exercises the abort path
+    (request already done when the re-check fires), by delivering the Stop hook
+    before the first stall window expires.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    # Deliver the Stop hook from inside fake_ensure — simulates a concurrent Stop
+    # arriving while the restart is in progress (after the lock re-check passes but
+    # before the resumed process has a chance to respond on its own).
+    ensure_calls = {"count": 0}
+    session_id_holder: list = []
+
+    def fake_ensure(st, sess) -> None:
+        ensure_calls["count"] += 1
+        sess.metadata["process_alive"] = "True"
+        # Deliver Stop hook concurrently — response must still be returned correctly.
+        sid = sess.session_id
+        threading.Thread(
+            target=lambda: request_json(
+                "POST",
+                f"{address}/hook/stop",
+                {"session_id": sid, "response": "CONCURRENT-STOP", "cwd": str(tmp_path)},
+            ),
+            daemon=True,
+        ).start()
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for a restart to fire (stall_restarts=1 set in metadata).
+        session_id = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                if sessions[0]["metadata"].get("stall_restarts") == "1":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert ensure_calls["count"] >= 1, "_ensure_process_metadata was not invoked"
+
+        req_thread.join(timeout=5)
+        assert result_box.get("result", {}).get("response") == "CONCURRENT-STOP", (
+            f"wrong response: {result_box.get('result')}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_restart_no_spurious_kill_when_already_done(tmp_path, monkeypatch) -> None:
+    """H2 abort path: if the request completes (Stop hook fires) before the stall
+    window expires, the watchdog must never call _ensure_process_metadata and must
+    not set stall_restarts in metadata.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    ensure_calls = {"count": 0}
+
+    def fake_ensure(st, sess) -> None:  # pragma: no cover — must NOT be called
+        ensure_calls["count"] += 1
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.5")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 5,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=7,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active, then deliver the Stop hook
+        # well before the 0.5s stall window can expire.
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.02)
+        assert session_id is not None, "request never became active"
+
+        # Deliver response before stall window expires — restart must not fire.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "EARLY-DONE", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+
+        assert result_box.get("result", {}).get("response") == "EARLY-DONE"
+        assert ensure_calls["count"] == 0, (
+            f"_ensure_process_metadata called unexpectedly: {ensure_calls}"
+        )
+        meta = request_json("GET", f"{address}/sessions")["sessions"][0]["metadata"]
+        assert "stall_restarts" not in meta, f"unexpected restart metadata: {meta}"
+    finally:
+        server.shutdown()
+        server.server_close()

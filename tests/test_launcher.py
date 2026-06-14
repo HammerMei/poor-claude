@@ -410,6 +410,43 @@ def test_rate_limit_acceptance_keys_no_match_without_marker() -> None:
     assert name is None
 
 
+def test_rate_limit_acceptance_keys_no_false_positive_when_strings_far_apart() -> None:
+    """Does not fire when the two detection strings appear far apart in prose.
+
+    A real conversation where Claude explains rate-limit handling might contain
+    both strings, but they will be separated by hundreds of characters.
+    The detector anchors the option text within 500 chars of the marker to
+    avoid false positives.
+    """
+    # Simulate a prose response: marker near the top, option text 600+ chars away.
+    prose = "/rate-limit-options" + "x" * 600 + "stop and wait for limit to reset"
+    keys, name = _rate_limit_acceptance_keys(prose)
+    assert keys is None
+    assert name is None
+
+
+def test_drain_pty_to_log_rate_limit_rearms_after_tui_leaves_buffer(tmp_path, monkeypatch) -> None:
+    """Rate-limit Enter is sent again when the TUI re-appears after leaving the buffer.
+
+    The re-arm path fires when TUI text leaves the 12 000-char sliding window.
+    This test verifies two separate TUI appearances each trigger one Enter.
+    """
+    log_path = tmp_path / "pty.log"
+    writes = []
+    rate_limit_chunk = b"/rate-limit-options\n1. Stop and wait for limit to reset\n"
+    # 12 001 bytes of filler scroll the first TUI chunk out of the window.
+    filler = b"x" * 12001
+    chunks = iter([rate_limit_chunk, filler, rate_limit_chunk, b""])
+
+    monkeypatch.setattr(launcher.os, "read", lambda fd, size: next(chunks))
+    monkeypatch.setattr(launcher.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    launcher._drain_pty_to_log(9, log_path)
+
+    assert writes == [(9, b"\r"), (9, b"\r")], f"expected two Enter keypresses, got: {writes}"
+
+
 def test_drain_pty_to_log_auto_dismisses_rate_limit_tui(tmp_path, monkeypatch) -> None:
     """The rate-limit TUI is auto-dismissed with Enter even after startup acceptance ends."""
     log_path = tmp_path / "pty.log"

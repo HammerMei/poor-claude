@@ -4234,17 +4234,27 @@ def test_rate_limit_hook_completes_active_request(tmp_path, monkeypatch) -> None
 
 
 def test_rate_limit_hook_idempotent_when_no_active_request(tmp_path, monkeypatch) -> None:
-    """POST /hook/rate-limit is idempotent: returns ok=True with no_active_request=True
-    when there is no active request on the route (e.g. Stop hook already completed it).
+    """POST /hook/rate-limit is idempotent in two distinct cases:
+    1. Route key doesn't exist (no_session).
+    2. Session exists but has no active request (e.g. Stop hook already completed it).
     """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
     state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
 
     try:
-        # POST with unknown route key — no session exists
+        # Case 1: route key doesn't exist → no_session
         result = request_json(
             "POST",
             f"{address}/hook/rate-limit",
@@ -4252,6 +4262,56 @@ def test_rate_limit_hook_idempotent_when_no_active_request(tmp_path, monkeypatch
         )
         assert result.get("ok") is True
         assert result.get("no_session") is True
+
+        # Case 2: session exists, request was completed by Stop hook, no active request
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for request to become active and grab route_key
+        route_key = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                route_key = sessions[0].get("route_key")
+                break
+            time.sleep(0.05)
+        assert route_key is not None, "request never became active"
+
+        # Stop hook completes the request first
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "response": "done", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3.0)
+        assert not req_thread.is_alive()
+
+        # Now fire the rate-limit hook — session has no active request
+        result = request_json(
+            "POST",
+            f"{address}/hook/rate-limit",
+            {"route_key": route_key},
+        )
+        assert result.get("ok") is True
+        assert result.get("no_active_request") is True
     finally:
         server.shutdown()
         server.server_close()

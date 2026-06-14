@@ -412,14 +412,17 @@ def _rate_limit_acceptance_keys(plain_text: str) -> tuple[list[bytes] | None, st
     prompt appears.  After pressing Enter Claude remains alive — it returns to the
     REPL prompt and waits for the rate limit to reset.
 
+    Detection is anchored: the option text must appear within 500 characters of
+    the "/rate-limit-options" marker (the actual TUI renders them within ~200 chars).
+    This prevents false positives when Claude outputs prose that happens to contain
+    the detection strings.
+
     This is a pure detector — it does NOT guard against repeated firing.
     Edge-triggering (fire once per TUI appearance, re-arm when text leaves the
     sliding window) is handled by the drain loop in _drain_pty_to_log.
     """
-    if (
-        "/rate-limit-options" in plain_text
-        and "stop and wait for limit to reset" in plain_text
-    ):
+    idx = plain_text.find("/rate-limit-options")
+    if idx >= 0 and "stop and wait for limit to reset" in plain_text[idx : idx + 500]:
         # Option 1 is already highlighted by default; confirm with Enter.
         return [b"\r"], "rate-limit-options"
     return None, None

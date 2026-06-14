@@ -816,6 +816,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
             managed = state.process_manager.get(session.route_key)
             if managed is None:
                 exit_msg = _get_process_exit_reason(session.metadata.get("claude_stdout_path"))
+                # Prefer a response Claude already wrote to the transcript over the
+                # error message — it's possible the process crashed after completing
+                # a turn but before the Stop hook fired.
+                if transcript_fallback_response is not None:
+                    exit_msg = transcript_fallback_response
                 with state.lock:
                     if state.registry._sessions.get(session.route_key) is not session:
                         raise RuntimeError("session route no longer exists")
@@ -834,6 +839,15 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                             response=exit_msg,
                         )
                         session.metadata["process_alive"] = "False"
+                        state.condition.notify_all()
+                    else:
+                        # Defensive: request is no longer active (superseded by another
+                        # or the registry was updated between process_manager.get() and
+                        # acquiring this lock).  Mark it done so it is not left in a
+                        # partial state; the active request will be handled by its own
+                        # handler thread.
+                        request.response = exit_msg
+                        session.completed_request_ids.append(request.request_id)
                         state.condition.notify_all()
                 intermediate = request.intermediate_response
                 if intermediate and intermediate != exit_msg:

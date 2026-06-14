@@ -3765,3 +3765,168 @@ def test_wait_for_response_restart_fallback_relaunches_with_resume(tmp_path, mon
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_wait_for_response_restart_aborts_when_request_completes_concurrently(tmp_path, monkeypatch) -> None:
+    """H2 (TOCTOU): when the Stop hook completes the request at the same time as
+    the watchdog decides to restart, the restart must be a no-op — no process kill,
+    restarts_done unchanged, response returned correctly.
+
+    This test simulates the race by delivering the Stop hook from inside
+    fake_ensure_process_metadata, which runs just after the re-check under the lock
+    has confirmed `do_restart=True`.  A second scenario exercises the abort path
+    (request already done when the re-check fires), by delivering the Stop hook
+    before the first stall window expires.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.2")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    # Deliver the Stop hook from inside fake_ensure — simulates a concurrent Stop
+    # arriving while the restart is in progress (after the lock re-check passes but
+    # before the resumed process has a chance to respond on its own).
+    ensure_calls = {"count": 0}
+    session_id_holder: list = []
+
+    def fake_ensure(st, sess) -> None:
+        ensure_calls["count"] += 1
+        sess.metadata["process_alive"] = "True"
+        # Deliver Stop hook concurrently — response must still be returned correctly.
+        sid = sess.session_id
+        threading.Thread(
+            target=lambda: request_json(
+                "POST",
+                f"{address}/hook/stop",
+                {"session_id": sid, "response": "CONCURRENT-STOP", "cwd": str(tmp_path)},
+            ),
+            daemon=True,
+        ).start()
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for a restart to fire (stall_restarts=1 set in metadata).
+        session_id = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                if sessions[0]["metadata"].get("stall_restarts") == "1":
+                    break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+        assert ensure_calls["count"] >= 1, "_ensure_process_metadata was not invoked"
+
+        req_thread.join(timeout=5)
+        assert result_box.get("result", {}).get("response") == "CONCURRENT-STOP", (
+            f"wrong response: {result_box.get('result')}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_restart_no_spurious_kill_when_already_done(tmp_path, monkeypatch) -> None:
+    """H2 abort path: if the request completes (Stop hook fires) before the stall
+    window expires, the watchdog must never call _ensure_process_metadata and must
+    not set stall_restarts in metadata.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    ensure_calls = {"count": 0}
+
+    def fake_ensure(st, sess) -> None:  # pragma: no cover — must NOT be called
+        ensure_calls["count"] += 1
+
+    monkeypatch.setattr("poor_claude.control_server._ensure_process_metadata", fake_ensure)
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0.5")
+    monkeypatch.setenv("POOR_CLAUDE_STALL_ACTION", "restart")
+    monkeypatch.setenv("POOR_CLAUDE_MAX_RESTARTS", "1")
+
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 5,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                },
+                timeout=7,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active, then deliver the Stop hook
+        # well before the 0.5s stall window can expire.
+        session_id = None
+        for _ in range(40):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0]["active_request"] is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.02)
+        assert session_id is not None, "request never became active"
+
+        # Deliver response before stall window expires — restart must not fire.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "EARLY-DONE", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3)
+
+        assert result_box.get("result", {}).get("response") == "EARLY-DONE"
+        assert ensure_calls["count"] == 0, (
+            f"_ensure_process_metadata called unexpectedly: {ensure_calls}"
+        )
+        meta = request_json("GET", f"{address}/sessions")["sessions"][0]["metadata"]
+        assert "stall_restarts" not in meta, f"unexpected restart metadata: {meta}"
+    finally:
+        server.shutdown()
+        server.server_close()

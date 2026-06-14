@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -420,7 +421,15 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # Enable it only after validating on a box where the hang reproduces, and set
     # the stall window above your agents' longest expected quiet period.  The
     # window must also be < the request timeout, or the kill path fires first.
-    stall_seconds = float(os.environ.get("POOR_CLAUDE_STALL_SECONDS", "0"))
+    try:
+        stall_seconds = float(os.environ.get("POOR_CLAUDE_STALL_SECONDS", "0"))
+    except ValueError:
+        print(
+            f"poor-claude: WARNING: invalid POOR_CLAUDE_STALL_SECONDS="
+            f"{os.environ['POOR_CLAUDE_STALL_SECONDS']!r}; watchdog disabled",
+            file=sys.stderr,
+        )
+        stall_seconds = 0.0
     # What to do on a detected stall:
     #   off                 - nothing (rely on the hard timeout/kill path)
     #   nudge               - send nudge messages only
@@ -429,9 +438,33 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
     # Nudging is cheap and preserves the turn but may be inert if Claude's loop is
     # fully wedged; restart is heavier but almost always recovers.  The ladder
     # covers both a soft SSE stall and a hard process wedge with one config.
+    _VALID_STALL_ACTIONS = {"off", "nudge", "restart", "nudge_then_restart"}
     stall_action = os.environ.get("POOR_CLAUDE_STALL_ACTION", "nudge_then_restart")
-    max_nudges = int(os.environ.get("POOR_CLAUDE_MAX_NUDGES", "3"))
-    max_restarts = int(os.environ.get("POOR_CLAUDE_MAX_RESTARTS", "1"))
+    if stall_action not in _VALID_STALL_ACTIONS:
+        print(
+            f"poor-claude: WARNING: invalid POOR_CLAUDE_STALL_ACTION={stall_action!r}; "
+            f"watchdog disabled (valid: {', '.join(sorted(_VALID_STALL_ACTIONS))})",
+            file=sys.stderr,
+        )
+        stall_action = "off"
+    try:
+        max_nudges = int(os.environ.get("POOR_CLAUDE_MAX_NUDGES", "3"))
+    except ValueError:
+        print(
+            f"poor-claude: WARNING: invalid POOR_CLAUDE_MAX_NUDGES="
+            f"{os.environ['POOR_CLAUDE_MAX_NUDGES']!r}; using default 3",
+            file=sys.stderr,
+        )
+        max_nudges = 3
+    try:
+        max_restarts = int(os.environ.get("POOR_CLAUDE_MAX_RESTARTS", "1"))
+    except ValueError:
+        print(
+            f"poor-claude: WARNING: invalid POOR_CLAUDE_MAX_RESTARTS="
+            f"{os.environ['POOR_CLAUDE_MAX_RESTARTS']!r}; using default 1",
+            file=sys.stderr,
+        )
+        max_restarts = 1
     nudge_prompt = os.environ.get(
         "POOR_CLAUDE_NUDGE_PROMPT",
         "Please continue your previous response.",
@@ -621,7 +654,11 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                 # so a wedged session can't trigger an unbounded restart loop.)
                 last_total_size = current_total_size
                 last_activity_at = time.time()
-                nudges_sent = 0
+                if nudges_sent != 0:
+                    nudges_sent = 0
+                    # M4: sync the reset back to metadata so status/observers see 0.
+                    with state.lock:
+                        session.metadata["nudges_sent"] = "0"
             elif (
                 request.response is None
                 and not session.pending_background_agent_ids
@@ -638,53 +675,94 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                     # Cheap first: a message reportedly revives a stuck SSE stream.
                     nudges_sent += 1
                     last_activity_at = time.time()  # wait another window before re-nudging
+                    skip_nudge = False
                     with state.lock:
-                        session.metadata["nudges_sent"] = str(nudges_sent)
-                        session.metadata["last_nudge_at"] = str(time.time())
-                    try:
-                        asyncio.run(
-                            state.mcp_router.route_prompt(
-                                route_key=session.route_key,
-                                session_id=session.session_id,
-                                request_id=request.request_id,
-                                prompt=nudge_prompt,
+                        # Re-check under lock — the request may have completed between
+                        # the unlocked stall check above and acquiring this lock.
+                        if request.response is not None or session.active_request is not request:
+                            nudges_sent -= 1  # undo the increment; request is already done
+                            skip_nudge = True
+                        else:
+                            session.metadata["nudges_sent"] = str(nudges_sent)
+                            session.metadata["last_nudge_at"] = str(time.time())
+                    if not skip_nudge:
+                        try:
+                            asyncio.run(
+                                state.mcp_router.route_prompt(
+                                    route_key=session.route_key,
+                                    session_id=session.session_id,
+                                    request_id=request.request_id,
+                                    prompt=nudge_prompt,
+                                )
                             )
-                        )
-                    except Exception:  # noqa: BLE001 - best-effort; restart/kill backstops
-                        pass
+                        except Exception:  # noqa: BLE001 - best-effort; restart/kill backstops
+                            pass
                 elif want_restart:
                     # Nudging exhausted or disabled and the process is still wedged:
                     # kill it and relaunch with `--resume` (conversation preserved via
                     # resume_on_launch -> spec.resume), then re-inject the stuck prompt
                     # so the resumed session processes it.  Reuses the tested
                     # _ensure_process_metadata relaunch path.
-                    restarts_done += 1
                     last_activity_at = time.time()
                     nudges_sent = 0
+                    do_restart = False
                     with state.lock:
                         if state.registry._sessions.get(session.route_key) is not session:
                             raise RuntimeError("session route no longer exists")
-                        session.metadata["restart_needed"] = "True"
-                        session.metadata["resume_on_launch"] = "True"
-                        session.metadata["stall_restarts"] = str(restarts_done)
-                        session.metadata["last_restart_at"] = str(time.time())
-                        state.mcp_router.clear_route(session.route_key)
+                        # H2: re-check under lock — the Stop hook may have completed
+                        # the request between the unlocked stall check and acquiring
+                        # this lock.  The early-return at the top of this loop then
+                        # returns the response without a spurious process kill.
+                        if request.response is None and session.active_request is request:
+                            do_restart = True
+                            restarts_done += 1
+                            session.metadata["restart_needed"] = "True"
+                            session.metadata["resume_on_launch"] = "True"
+                            session.metadata["stall_restarts"] = str(restarts_done)
+                            session.metadata["last_restart_at"] = str(time.time())
+                            session.metadata["nudges_sent"] = "0"  # M4: sync reset
+                            state.mcp_router.clear_route(session.route_key)
+                            # H1: do NOT call _ensure_process_metadata here — it calls
+                            # process_manager.stop() which can block up to ~8 s (SIGTERM
+                            # wait + drain), freezing every lock waiter including Stop
+                            # hook handlers.  Called below after releasing the lock.
+                    if do_restart:
+                        # H1: process stop + relaunch outside the lock.  Safe because
+                        # the only other _ensure_process_metadata call sites are:
+                        # (a) new-session POST — different session object; and
+                        # (b) the launch_process path — guarded against running when
+                        # active_request is not None (see "restart_needed" guard above).
+                        #
+                        # Best-effort window: if the Stop hook completes the request
+                        # between this point and the process_manager.stop() call inside
+                        # _ensure_process_metadata, the finished process is killed and
+                        # the re-injected prompt hits the resumed session.  The response
+                        # is still returned correctly on the next loop iteration via the
+                        # early-return at the top of this loop.  This window is narrow
+                        # (lock release → stop()) and the consequence is a spurious
+                        # resume, not a lost response.
                         try:
                             _ensure_process_metadata(state, session)
                         except Exception:  # noqa: BLE001 - best-effort; kill path backstops
                             pass
-                        state.condition.notify_all()
-                    try:
-                        asyncio.run(
-                            state.mcp_router.route_prompt(
-                                route_key=session.route_key,
-                                session_id=session.session_id,
-                                request_id=request.request_id,
-                                prompt=str(request.prompt),
+                        # M1: give the resumed session a full timeout window from
+                        # now — without this the remaining budget after nudging
+                        # (up to MAX_NUDGES × stall_seconds elapsed) may not be
+                        # enough for the resumed turn to complete.
+                        deadline = max(deadline, time.time() + timeout_seconds)
+                        with state.lock:
+                            state.condition.notify_all()
+                        try:
+                            asyncio.run(
+                                state.mcp_router.route_prompt(
+                                    route_key=session.route_key,
+                                    session_id=session.session_id,
+                                    request_id=request.request_id,
+                                    prompt=str(request.prompt),
+                                )
                             )
-                        )
-                    except Exception:  # noqa: BLE001 - best-effort; kill path backstops
-                        pass
+                        except Exception:  # noqa: BLE001 - best-effort; kill path backstops
+                            pass
 
         remaining = deadline - time.time()
         if remaining <= 0:

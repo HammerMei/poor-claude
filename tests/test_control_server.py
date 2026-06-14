@@ -4083,6 +4083,76 @@ def test_wait_for_response_fast_fails_on_process_death_generic(tmp_path, monkeyp
         server.server_close()
 
 
+def test_wait_for_response_fast_fails_prefers_transcript_over_exit_msg(tmp_path, monkeypatch) -> None:
+    """When the Claude process dies on the same iteration that the transcript first shows a
+    complete end_turn response, _wait_for_response must return the transcript text rather
+    than the generic exit message.
+
+    This tests the 'transcript_response + end_turn' branch in the fast-fail block, which is
+    needed because transcript_fallback_response is only promoted after 0.5 s of stability —
+    it is still None on the very first iteration where a response appears.
+    """
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    # The transcript read always returns the completed response immediately
+    # (simulating: Claude wrote its answer and died in the same 0.5s window).
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse(text="THE-REAL-ANSWER", stop_reason="end_turn"),
+    )
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                break
+            time.sleep(0.05)
+
+        # Terminate process — death check should fire and prefer the transcript text
+        fake_process.terminated = True
+
+        req_thread.join(timeout=5.0)
+        assert not req_thread.is_alive(), "request did not complete"
+        response = result_box.get("result", {}).get("response", "")
+        assert response == "THE-REAL-ANSWER", (
+            f"expected transcript text, got: {response!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_wait_for_response_no_false_positive_while_process_alive(tmp_path, monkeypatch) -> None:
     """The fast-fail death check must NOT fire while the process is alive.
     A live process should allow the request to complete normally via the Stop hook.

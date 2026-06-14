@@ -386,9 +386,10 @@ def _get_process_exit_reason(stdout_path: str | None) -> str:
         with path.open("rb") as fh:
             fh.seek(max(0, size - 8192))
             tail = fh.read()
-        if b"/rate-limit-options" in tail or b"stop and wait for limit to reset" in tail.lower():
+        tail_lower = tail.lower()
+        if b"/rate-limit-options" in tail_lower or b"stop and wait for limit to reset" in tail_lower:
             return (
-                "Org monthly spend limit reached — Claude exited and saved the session. "
+                "Org monthly spend limit reached — Claude has stopped and saved the session. "
                 "It will resume automatically when the limit resets."
             )
     except OSError:
@@ -819,7 +820,15 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                 # Prefer a response Claude already wrote to the transcript over the
                 # error message — it's possible the process crashed after completing
                 # a turn but before the Stop hook fired.
-                if transcript_fallback_response is not None:
+                #
+                # Check transcript_response (current iteration) with end_turn guard first:
+                # transcript_fallback_response only gets promoted after 0.5 s of stability,
+                # so on the first iteration where a complete response appears it is still
+                # None even though the answer is already on disk.  A partial tool-use
+                # response is NOT a complete turn — prefer exit_msg in that case.
+                if transcript_response is not None and transcript_stop_reason == "end_turn":
+                    exit_msg = transcript_response
+                elif transcript_fallback_response is not None:
                     exit_msg = transcript_fallback_response
                 with state.lock:
                     if state.registry._sessions.get(session.route_key) is not session:
@@ -1416,8 +1425,17 @@ def make_handler(state: ControlState):
 
             The drain thread injects Enter to dismiss the TUI, then POSTs here so the
             waiting caller gets an immediate error instead of hanging until the hard
-            30-minute timeout.  Claude stays alive — it returns to the REPL prompt and
-            will resume serving requests once the limit resets.
+            30-minute timeout.
+
+            NOTE: Whether Claude stays alive after the TUI is dismissed or eventually
+            exits needs empirical confirmation.  Currently finish_request_for_route is
+            called with promote=True (the default), which means a queued request would
+            be promoted and routed to Claude immediately.  If Claude remains blocked on
+            the rate limit, that promoted request will hang until the limit resets or the
+            stall watchdog kills the process.  If this becomes a problem in practice,
+            switch to promote=False here so the queue is not advanced into a
+            rate-limited process.
+            TODO: validate on a real rate-limit event and update accordingly.
 
             Idempotent: silently no-ops if there is no active request (e.g. the real
             Stop hook already completed it) or if the route is unknown.
@@ -1428,7 +1446,7 @@ def make_handler(state: ControlState):
                 if not route_key:
                     raise RuntimeError("rate-limit hook payload missing route_key")
                 error_msg = (
-                    "Org monthly spend limit reached — Claude has stopped and saved the "
+                    "Org monthly spend limit reached — Claude has paused and saved the "
                     "session.  It will resume automatically when the limit resets."
                 )
                 with state.lock:

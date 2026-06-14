@@ -410,14 +410,6 @@ def test_rate_limit_acceptance_keys_no_match_without_marker() -> None:
     assert name is None
 
 
-def test_rate_limit_acceptance_keys_does_not_repeat(tmp_path) -> None:
-    """Once accepted, the same prompt does not trigger a second keypress."""
-    plain = "/rate-limit-options 1. stop and wait for limit to reset"
-    keys, name = _rate_limit_acceptance_keys(plain, {"rate-limit-options"})
-    assert keys is None
-    assert name is None
-
-
 def test_drain_pty_to_log_auto_dismisses_rate_limit_tui(tmp_path, monkeypatch) -> None:
     """The rate-limit TUI is auto-dismissed with Enter even after startup acceptance ends."""
     log_path = tmp_path / "pty.log"

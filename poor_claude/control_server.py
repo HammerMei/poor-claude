@@ -366,6 +366,36 @@ def _should_cleanup_project_settings_locked(state: ControlState, workdir: str) -
     return all(session.workdir != workdir for session in state.registry._sessions.values())
 
 
+def _get_process_exit_reason(stdout_path: str | None) -> str:
+    """Read the tail of Claude's stdout log to determine the cause of exit.
+
+    Returns a human-readable message suitable for returning to the caller.
+    Reads only the last 8 KiB so it is cheap regardless of log size.
+    """
+    _default = (
+        "Claude process exited unexpectedly; "
+        "session may be resumable with --resume"
+    )
+    if not stdout_path:
+        return _default
+    try:
+        path = Path(stdout_path)
+        size = path.stat().st_size
+        if size == 0:
+            return _default
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 8192))
+            tail = fh.read()
+        if b"/rate-limit-options" in tail or b"stop and wait for limit to reset" in tail.lower():
+            return (
+                "Org monthly spend limit reached — Claude exited and saved the session. "
+                "It will resume automatically when the limit resets."
+            )
+    except OSError:
+        pass
+    return _default
+
+
 def _wait_for_response(state: ControlState, session, request, *, timeout_seconds: int) -> str:
     deadline = time.time() + timeout_seconds
     candidates = transcript_candidates(session_id=session.session_id, workdir=session.workdir)
@@ -764,6 +794,52 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                         except Exception:  # noqa: BLE001 - best-effort; kill path backstops
                             pass
 
+        # --- fast-fail on process death -------------------------------------------
+        # Detect when Claude exits without firing a Stop hook (e.g. after the
+        # rate-limit TUI is dismissed via `\r` injection) so we return an error
+        # immediately instead of waiting for the hard 30-min timeout.
+        #
+        # Guard: skip when process_stopping is "True" (the deadline-kill path owns
+        # the process lifecycle and will return its own error) or when no process
+        # has ever been started for this session.
+        #
+        # The stall-watchdog restart path is self-synchronised: _ensure_process_metadata
+        # runs synchronously on *this same thread* (see line `_ensure_process_metadata(
+        # state, session)` in the want_restart block above), so by the time execution
+        # reaches here the new process is already registered in process_manager —
+        # process_manager.get() returns the live replacement, never None, ruling out
+        # false positives from that path.
+        if (
+            session.metadata.get("process_pid")
+            and session.metadata.get("process_stopping") != "True"
+        ):
+            managed = state.process_manager.get(session.route_key)
+            if managed is None:
+                exit_msg = _get_process_exit_reason(session.metadata.get("claude_stdout_path"))
+                with state.lock:
+                    if state.registry._sessions.get(session.route_key) is not session:
+                        raise RuntimeError("session route no longer exists")
+                    # Re-check under lock: the Stop hook may have fired between
+                    # process_manager.get() and acquiring this lock.
+                    if request.response is not None or request.request_id in session.completed_request_ids:
+                        final = request.response or ""
+                        intermediate = request.intermediate_response
+                        if intermediate and intermediate != final:
+                            return f"{intermediate}\n\n{final}"
+                        return final
+                    if session.active_request is request:
+                        state.registry.finish_request_for_route(
+                            route=session.route_key,
+                            request_id=request.request_id,
+                            response=exit_msg,
+                        )
+                        session.metadata["process_alive"] = "False"
+                        state.condition.notify_all()
+                intermediate = request.intermediate_response
+                if intermediate and intermediate != exit_msg:
+                    return f"{intermediate}\n\n{exit_msg}"
+                return exit_msg
+
         remaining = deadline - time.time()
         if remaining <= 0:
             should_stop_process = False
@@ -935,6 +1011,9 @@ def make_handler(state: ControlState):
                 return
             if self.path == "/hook/subagent-stop":
                 self._handle_subagent_stop_hook()
+                return
+            if self.path == "/hook/rate-limit":
+                self._handle_rate_limit_hook()
                 return
             if self.path == "/shutdown":
                 with state.lock:
@@ -1314,6 +1393,51 @@ def make_handler(state: ControlState):
                     session.pending_background_agent_ids.add(agent_id)
                     pending_count = len(session.pending_background_agent_ids)
                 self._send_json(200, {"ok": True, "pending": pending_count})
+            except Exception as exc:
+                self._send_error(400, str(exc))
+
+        def _handle_rate_limit_hook(self) -> None:
+            """Complete the active request with a rate-limit error when the drain thread
+            detects the /rate-limit-options TUI.
+
+            The drain thread injects Enter to dismiss the TUI, then POSTs here so the
+            waiting caller gets an immediate error instead of hanging until the hard
+            30-minute timeout.  Claude stays alive — it returns to the REPL prompt and
+            will resume serving requests once the limit resets.
+
+            Idempotent: silently no-ops if there is no active request (e.g. the real
+            Stop hook already completed it) or if the route is unknown.
+            """
+            try:
+                payload = self._read_json()
+                route_key = payload.get("route_key")
+                if not route_key:
+                    raise RuntimeError("rate-limit hook payload missing route_key")
+                error_msg = (
+                    "Org monthly spend limit reached — Claude has stopped and saved the "
+                    "session.  It will resume automatically when the limit resets."
+                )
+                with state.lock:
+                    session = state.registry._sessions.get(route_key)
+                    if session is None:
+                        self._send_json(200, {"ok": True, "no_session": True})
+                        return
+                    req = session.active_request
+                    if (
+                        req is None
+                        or req.response is not None
+                        or req.request_id in session.completed_request_ids
+                    ):
+                        # Already completed (Stop hook beat us, or no active request).
+                        self._send_json(200, {"ok": True, "no_active_request": True})
+                        return
+                    state.registry.finish_request_for_route(
+                        route=route_key,
+                        request_id=req.request_id,
+                        response=error_msg,
+                    )
+                    state.condition.notify_all()
+                self._send_json(200, {"ok": True})
             except Exception as exc:
                 self._send_error(400, str(exc))
 

@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prune-sessions", action="store_true")
     parser.add_argument("--view", metavar="SESSION_ID",
         help="Print the conversation transcript for a session to stdout")
+    parser.add_argument("--with-tools", action="store_true",
+        help="Include tool calls and results when using --view")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--launch-process", action="store_true")
     parser.set_defaults(auto_accept_startup_prompts=True)
@@ -171,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.view:
-            printed = _view_session(args.view, workdir=args.workdir)
+            printed = _view_session(args.view, workdir=args.workdir, with_tools=args.with_tools)
             return 0 if printed else 1
 
         if args.stop_session:
@@ -340,12 +342,12 @@ _CHANNEL_WRAPPER_RE = re.compile(r'<channel source="poor-claude"[^>]*>.*?</chann
 def _extract_prompt(content: str | list) -> str | None:
     """Pull the actual user prompt out of the poor-claude channel wrapper.
 
-    Returns the raw prompt string, or None if the content doesn't look like a
-    poor-claude channel message (e.g. it's a plain string or a tool-result block).
-    Falls back to the full content string if no wrapper is detected.
+    Returns the raw prompt string, or None if the content contains no channel
+    message (e.g. it's purely tool_result blocks returned after a tool call).
     """
     if isinstance(content, list):
-        # Look for a tool_result block that contains the channel message.
+        # Channel messages are delivered as a tool_result block whose inner
+        # content is the XML-wrapped prompt string.
         texts = []
         for block in content:
             if isinstance(block, dict):
@@ -362,13 +364,33 @@ def _extract_prompt(content: str | list) -> str | None:
     m = _CHANNEL_PROMPT_RE.search(content)
     if m:
         return m.group(1).strip()
-    # Not a channel message — return as-is (stripped of any wrapper cruft).
+    # Not a channel message — check if there's any non-wrapper text.
     stripped = _CHANNEL_WRAPPER_RE.sub("", content).strip()
     return stripped or None
 
 
-def _extract_response(content: str | list) -> str:
-    """Extract the text from an assistant message content block array."""
+def _extract_tool_results(content: str | list) -> list[tuple[str, str]]:
+    """Return (tool_use_id, text) pairs from tool_result blocks in a user message."""
+    if not isinstance(content, list):
+        return []
+    results = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id", "")
+        inner = block.get("content", "")
+        if isinstance(inner, list):
+            text = "\n".join(b.get("text", "") for b in inner if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = str(inner) if inner else ""
+        # Skip if it's actually the channel message wrapper (not a tool result).
+        if "poor-claude-request" not in text:
+            results.append((tool_use_id, text))
+    return results
+
+
+def _extract_response(content: str | list, *, with_tools: bool = False) -> str:
+    """Extract the text (and optionally tool calls) from an assistant message."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -381,11 +403,16 @@ def _extract_response(content: str | list) -> str:
             text = block.get("text", "").strip()
             if text:
                 parts.append(text)
+        elif block.get("type") == "tool_use" and with_tools:
+            name = block.get("name", "unknown")
+            inp = block.get("input", {})
+            parts.append(f"── Tool: {name} {'─' * max(0, 46 - len(name))}")
+            parts.append(json.dumps(inp, indent=2, ensure_ascii=False))
         # Skip thinking blocks — they're internal reasoning, not the response.
     return "\n".join(parts)
 
 
-def _view_session(session_id: str, *, workdir: str) -> bool:
+def _view_session(session_id: str, *, workdir: str, with_tools: bool = False) -> bool:
     """Print a human-readable transcript to stdout. Returns True if found."""
     candidates = transcript_candidates(session_id=session_id, workdir=workdir)
     path = next((p for p in candidates if p.exists()), None)
@@ -414,9 +441,17 @@ def _view_session(session_id: str, *, workdir: str) -> bool:
                     print(f"{'─' * 60}")
                     print(prompt)
                     print()
+                elif with_tools:
+                    tool_results = _extract_tool_results(content)
+                    for tool_use_id, text in tool_results:
+                        print(f"{'─' * 60}")
+                        print(f"TOOL RESULT  {tool_use_id}")
+                        print(f"{'─' * 60}")
+                        print(text)
+                        print()
             elif msg_type == "assistant":
                 content = obj.get("message", {}).get("content", "")
-                response = _extract_response(content)
+                response = _extract_response(content, with_tools=with_tools)
                 if response:
                     print(f"{'─' * 60}")
                     print(f"[{turn}] ASSISTANT")

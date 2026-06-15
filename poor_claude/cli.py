@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -13,6 +14,7 @@ from poor_claude.config import resolve_timeout, resolve_ttl
 from poor_claude.daemon import default_state_path, discover_state, start_daemon
 from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.prompt import PromptError, resolve_prompt
+from poor_claude.transcript import transcript_candidates
 
 
 RESUME_PICKER_SENTINEL = "__poor_claude_resume_picker__"
@@ -61,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sessions", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--prune-sessions", action="store_true")
+    parser.add_argument("--view", metavar="SESSION_ID",
+        help="Print the conversation transcript for a session to stdout")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--launch-process", action="store_true")
     parser.set_defaults(auto_accept_startup_prompts=True)
@@ -106,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions, args.prune_sessions]
+    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions, args.prune_sessions, args.view]
     needs_prompt = not any(control_commands)
     resolved = None
     if needs_prompt or args.dry_run:
@@ -165,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
                 count = len(removed) if isinstance(removed, list) else 0
                 print(f"Pruned {count} session(s).")
             return 0
+
+        if args.view:
+            printed = _view_session(args.view, workdir=args.workdir)
+            return 0 if printed else 1
 
         if args.stop_session:
             if not target_session_id:
@@ -318,6 +326,107 @@ def _format_sessions(sessions: object) -> str:
     for row in rows:
         lines.append("  ".join(row[header].ljust(widths[header]) for header in headers))
     return "\n".join(lines)
+
+
+# ── session transcript viewer ──────────────────────────────────────────────────
+
+_CHANNEL_PROMPT_RE = re.compile(
+    r"USER PROMPT:\n(.*?)(?:\n</poor-claude-request>|$)",
+    re.DOTALL,
+)
+_CHANNEL_WRAPPER_RE = re.compile(r'<channel source="poor-claude"[^>]*>.*?</channel>', re.DOTALL)
+
+
+def _extract_prompt(content: str | list) -> str | None:
+    """Pull the actual user prompt out of the poor-claude channel wrapper.
+
+    Returns the raw prompt string, or None if the content doesn't look like a
+    poor-claude channel message (e.g. it's a plain string or a tool-result block).
+    Falls back to the full content string if no wrapper is detected.
+    """
+    if isinstance(content, list):
+        # Look for a tool_result block that contains the channel message.
+        texts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_result":
+                    inner = block.get("content", "")
+                    if isinstance(inner, list):
+                        inner = " ".join(b.get("text", "") for b in inner if isinstance(b, dict))
+                    texts.append(str(inner))
+                elif block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+        content = "\n".join(texts)
+    if not isinstance(content, str):
+        return None
+    m = _CHANNEL_PROMPT_RE.search(content)
+    if m:
+        return m.group(1).strip()
+    # Not a channel message — return as-is (stripped of any wrapper cruft).
+    stripped = _CHANNEL_WRAPPER_RE.sub("", content).strip()
+    return stripped or None
+
+
+def _extract_response(content: str | list) -> str:
+    """Extract the text from an assistant message content block array."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text", "").strip()
+            if text:
+                parts.append(text)
+        # Skip thinking blocks — they're internal reasoning, not the response.
+    return "\n".join(parts)
+
+
+def _view_session(session_id: str, *, workdir: str) -> bool:
+    """Print a human-readable transcript to stdout. Returns True if found."""
+    candidates = transcript_candidates(session_id=session_id, workdir=workdir)
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        print(f"No transcript found for session {session_id!r}", file=sys.stderr)
+        return False
+
+    turn = 0
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            msg_type = obj.get("type")
+            if msg_type == "user":
+                content = obj.get("message", {}).get("content", "")
+                prompt = _extract_prompt(content)
+                if prompt:
+                    turn += 1
+                    print(f"{'─' * 60}")
+                    print(f"[{turn}] USER")
+                    print(f"{'─' * 60}")
+                    print(prompt)
+                    print()
+            elif msg_type == "assistant":
+                content = obj.get("message", {}).get("content", "")
+                response = _extract_response(content)
+                if response:
+                    print(f"{'─' * 60}")
+                    print(f"[{turn}] ASSISTANT")
+                    print(f"{'─' * 60}")
+                    print(response)
+                    print()
+    if turn == 0:
+        print(f"Transcript at {path} exists but contains no user/assistant turns.", file=sys.stderr)
+        return False
+    return True
 
 
 if __name__ == "__main__":  # pragma: no cover

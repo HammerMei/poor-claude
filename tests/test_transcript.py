@@ -82,6 +82,71 @@ def test_read_response_record_after_request_from_file_includes_stop_reason(tmp_p
     assert response.stop_reason == "end_turn"
 
 
+def test_read_response_record_after_request_from_file_detects_rate_limit_error(tmp_path) -> None:
+    # Mirrors a real transcript entry Claude Code writes when the org monthly
+    # spend limit is hit: a synthetic assistant message with stop_reason
+    # "stop_sequence" (never "end_turn") and top-level error/isApiErrorMessage
+    # markers. No interactive /rate-limit-options TUI is shown for this case.
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "You've hit your org's monthly spend limit",
+                                }
+                            ],
+                            "stop_reason": "stop_sequence",
+                        },
+                        "error": "rate_limit",
+                        "isApiErrorMessage": True,
+                        "apiErrorStatus": 429,
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    response = read_response_record_after_request_from_file(transcript, request_id="req1")
+    assert response is not None
+    assert response.stop_reason == "stop_sequence"
+    assert response.is_rate_limit_error is True
+
+
+def test_read_response_record_after_request_from_file_stop_sequence_without_error_is_not_rate_limit(
+    tmp_path,
+) -> None:
+    # A plain stop_sequence completion (e.g. a custom stop string) must not be
+    # misclassified as a rate-limit error just because it isn't "end_turn".
+    transcript = tmp_path / "demo.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"message": {"role": "user", "content": '<poor-claude-request id="req1">'}}),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final",
+                            "stop_reason": "stop_sequence",
+                        }
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    response = read_response_record_after_request_from_file(transcript, request_id="req1")
+    assert response is not None
+    assert response.is_rate_limit_error is False
+
+
 def test_read_response_after_request_ignores_missing_response(tmp_path) -> None:
     transcript = tmp_path / "demo.jsonl"
     transcript.write_text(

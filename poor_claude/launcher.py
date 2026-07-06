@@ -9,6 +9,8 @@ import pty
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +39,8 @@ class ClaudeLaunchSpec:
     system_prompt: str | None = None
     tools: list[str] | None = None
     add_dirs: list[str] | None = None
+    rate_limit_hook_url: str | None = None
+    rate_limit_hook_route_key: str | None = None
 
 
 # System-prompt fragment that authorises the poor-claude MCP channel transport.
@@ -116,7 +120,13 @@ def launch_claude(spec: ClaudeLaunchSpec) -> subprocess.Popen:
         # process blocks on any write and the session stalls permanently.
         thread = threading.Thread(
             target=_drain_pty_to_log,
-            args=(master_fd, spec.stdout_path, spec.auto_accept_workspace_trust),
+            args=(
+                master_fd,
+                spec.stdout_path,
+                spec.auto_accept_workspace_trust,
+                spec.rate_limit_hook_url,
+                spec.rate_limit_hook_route_key,
+            ),
             daemon=True,
         )
         thread.start()
@@ -279,6 +289,8 @@ def prepare_launch_spec(
         system_prompt=session.metadata.get("system_prompt") or None,
         tools=_parse_tools_metadata(session.metadata.get("tools") or ""),
         add_dirs=_parse_json_list_metadata(session.metadata.get("add_dirs") or ""),
+        rate_limit_hook_url=f"{callback_base_url.rstrip('/')}/hook/rate-limit",
+        rate_limit_hook_route_key=session.route_key,
     )
 
 
@@ -325,12 +337,24 @@ def cleanup_project_mcp_config(project_dir: Path) -> None:
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\)|[()][A-Za-z0-9]|[=>][0-9]*[A-Za-z]?)")
 
 
-def _drain_pty_to_log(master_fd: int, log_path: Path | None, auto_accept_startup_prompts: bool = False) -> None:
+def _drain_pty_to_log(
+    master_fd: int,
+    log_path: Path | None,
+    auto_accept_startup_prompts: bool = False,
+    rate_limit_hook_url: str | None = None,
+    rate_limit_hook_route_key: str | None = None,
+) -> None:
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
     recent = ""
     accepted: set[str] = set()
     startup_deadline = time.monotonic() + 30.0
+    # Edge-triggered rate-limit tracking: fires once per TUI *appearance*
+    # (absent→present transition) and re-arms when the TUI text leaves the
+    # sliding window.  This correctly handles multiple rate-limit events per
+    # process lifetime — the old once-per-process guard caused subsequent TUI
+    # appearances to hang unacknowledged.
+    rate_limit_signaled = False
     with (log_path.open("ab") if log_path is not None else open(os.devnull, "wb")) as handle:  # noqa: WPS515
         while True:
             try:
@@ -341,24 +365,91 @@ def _drain_pty_to_log(master_fd: int, log_path: Path | None, auto_accept_startup
                 return
             handle.write(chunk)
             handle.flush()
+            # Always track recent output for prompt detection (both startup and
+            # always-on prompts such as the rate-limit TUI).
+            recent = (recent + chunk.decode("utf-8", errors="ignore"))[-12000:]
+            plain_recent = _plain_terminal_text(recent)
             if auto_accept_startup_prompts:
-                recent = (recent + chunk.decode("utf-8", errors="ignore"))[-12000:]
-                plain_recent = _plain_terminal_text(recent)
                 if time.monotonic() > startup_deadline or "listening for channel messages" in plain_recent:
                     auto_accept_startup_prompts = False
-                    continue
-                key_chunks, prompt_name = _startup_acceptance_keys(recent, accepted)
-                if key_chunks is not None and prompt_name is not None:
-                    try:
-                        handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
-                        handle.flush()
-                        for i, key_chunk in enumerate(key_chunks):
-                            if i > 0:
-                                time.sleep(0.05)
-                            os.write(master_fd, key_chunk)
-                        accepted.add(prompt_name)
-                    except OSError:
-                        return
+                else:
+                    key_chunks, prompt_name = _startup_acceptance_keys(recent, accepted)
+                    if key_chunks is not None and prompt_name is not None:
+                        try:
+                            handle.write(f"\n[poor-claude auto-accept startup prompt: {prompt_name}]\n".encode("utf-8"))
+                            handle.flush()
+                            for i, key_chunk in enumerate(key_chunks):
+                                if i > 0:
+                                    time.sleep(0.05)
+                                os.write(master_fd, key_chunk)
+                            accepted.add(prompt_name)
+                        except OSError:
+                            return
+            # Always-on: edge-triggered rate-limit TUI dismissal.
+            # Fire on absent→present transition; re-arm when TUI text leaves
+            # the 12 000-char sliding window.
+            rate_limit_present = bool(_rate_limit_acceptance_keys(plain_recent)[0])
+            if rate_limit_present and not rate_limit_signaled:
+                try:
+                    handle.write(b"\n[poor-claude auto-accept: rate-limit-options]\n")
+                    handle.flush()
+                    os.write(master_fd, b"\r")
+                except OSError:
+                    return
+                rate_limit_signaled = True
+                if rate_limit_hook_url and rate_limit_hook_route_key:
+                    _dispatch_rate_limit_callback(rate_limit_hook_url, rate_limit_hook_route_key)
+            elif not rate_limit_present:
+                rate_limit_signaled = False  # re-arm for next TUI appearance
+
+
+def _rate_limit_acceptance_keys(plain_text: str) -> tuple[list[bytes] | None, str | None]:
+    """Detect the /rate-limit-options interactive TUI.
+
+    Claude Code shows this blocking prompt when the org hits its monthly spend
+    limit.  In headless/PTY mode there is no human to press Enter, so poor-claude
+    auto-selects option 1 ("Stop and wait for limit to reset") the moment the
+    prompt appears.  After pressing Enter Claude remains alive — it returns to the
+    REPL prompt and waits for the rate limit to reset.
+
+    Detection is anchored: the option text must appear within 500 characters of
+    the "/rate-limit-options" marker (the actual TUI renders them within ~200 chars).
+    This prevents false positives when Claude outputs prose that happens to contain
+    the detection strings.
+
+    This is a pure detector — it does NOT guard against repeated firing.
+    Edge-triggering (fire once per TUI appearance, re-arm when text leaves the
+    sliding window) is handled by the drain loop in _drain_pty_to_log.
+    """
+    idx = plain_text.find("/rate-limit-options")
+    if idx >= 0 and "stop and wait for limit to reset" in plain_text[idx : idx + 500]:
+        # Option 1 is already highlighted by default; confirm with Enter.
+        return [b"\r"], "rate-limit-options"
+    return None, None
+
+
+def _dispatch_rate_limit_callback(url: str, route_key: str) -> None:
+    """POST to /hook/rate-limit on a throwaway daemon thread.
+
+    Called from the PTY drain thread when a rate-limit TUI is detected.  The POST
+    must not block the drain loop — if the kernel PTY buffer fills while we wait on
+    the control server, Claude blocks on every write and the session stalls.
+    """
+    def _post() -> None:
+        try:
+            body = json.dumps({"route_key": route_key}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3):  # noqa: S310 — local control server
+                pass
+        except Exception:  # noqa: BLE001
+            pass  # best-effort; the fast-fail-on-death check is the safety net
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 def _startup_acceptance_keys(raw_text: str, accepted: set[str] | None = None) -> tuple[list[bytes] | None, str | None]:

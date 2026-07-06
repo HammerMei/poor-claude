@@ -927,6 +927,49 @@ def test_control_server_completes_from_end_turn_transcript_before_timeout(tmp_pa
         server.server_close()
 
 
+def test_control_server_completes_from_rate_limit_transcript_without_end_turn(tmp_path, monkeypatch) -> None:
+    # Regression test for the 2026-07-06 lockup: Claude Code injects a synthetic
+    # assistant turn (stop_reason "stop_sequence", never "end_turn") when the org
+    # monthly spend limit is hit, and never fires the Stop hook for it. Before the
+    # fix, _wait_for_response's transcript fallback only completed on
+    # stop_reason == "end_turn", so the request — and the whole route — hung until
+    # the hard timeout with no way to self-recover once the limit reset. Confirmed
+    # live on the production daemon: active_request stayed non-None indefinitely
+    # for exactly this transcript shape.
+    server, address = start_test_server()
+    calls = {"count": 0}
+
+    def fake_read_response(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            return None
+        return TranscriptResponse(
+            "You've hit your org's monthly spend limit",
+            stop_reason="stop_sequence",
+            is_rate_limit_error=True,
+        )
+
+    monkeypatch.setattr("poor_claude.control_server.read_response_record_after_request_from_file", fake_read_response)
+    try:
+        result = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+                "wait_for_response": True,
+            },
+            timeout=5,
+        )
+        assert result["status"] == "completed"
+        assert result["response"] == "You've hit your org's monthly spend limit"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_accepts_duplicate_stop_hook_for_completed_request(tmp_path) -> None:
     server, address = start_test_server()
     try:
@@ -3927,6 +3970,461 @@ def test_wait_for_response_restart_no_spurious_kill_when_already_done(tmp_path, 
         )
         meta = request_json("GET", f"{address}/sessions")["sessions"][0]["metadata"]
         assert "stall_restarts" not in meta, f"unexpected restart metadata: {meta}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_fast_fails_on_process_death_rate_limit(tmp_path, monkeypatch) -> None:
+    """When the Claude process exits without firing a Stop hook and the stdout log
+    shows a rate-limit TUI, _wait_for_response must return a rate-limit error
+    message immediately rather than waiting for the hard 30-min timeout.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")  # disable stall watchdog
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,  # long timeout — fast-fail must preempt it
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active and grab the stdout log path.
+        # Note: the /sessions endpoint nests the path under metadata["claude_stdout_path"],
+        # not as a top-level "stdout" key.
+        stdout_path_str = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                stdout_path_str = sessions[0].get("metadata", {}).get("claude_stdout_path")
+                break
+            time.sleep(0.05)
+        assert stdout_path_str is not None, "request never became active or stdout path missing"
+
+        # Write rate-limit content to the stdout log (file may not yet exist)
+        stdout_path = Path(stdout_path_str)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(
+            b"some normal output\n/rate-limit-options\nstop and wait for limit to reset\n"
+        )
+
+        # Simulate the process exiting: FakeProcess.poll() returns 0 when terminated=True
+        fake_process.terminated = True
+
+        # Fast-fail should trigger within ~1 s (a couple of 0.5s loop iterations)
+        start = time.time()
+        req_thread.join(timeout=5.0)
+        elapsed = time.time() - start
+
+        assert not req_thread.is_alive(), "request did not complete after process death"
+        assert elapsed < 4.0, f"fast-fail too slow: {elapsed:.2f}s (expected <4s)"
+        response = result_box.get("result", {}).get("response", "")
+        assert "limit" in response.lower(), f"expected rate-limit message, got: {response!r}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_fast_fails_on_process_death_generic(tmp_path, monkeypatch) -> None:
+    """When the Claude process exits without a Stop hook and the log contains no
+    rate-limit marker, _wait_for_response returns the generic 'exited unexpectedly'
+    error message immediately.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        stdout_path_str = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                stdout_path_str = sessions[0].get("metadata", {}).get("claude_stdout_path")
+                break
+            time.sleep(0.05)
+        assert stdout_path_str is not None, "request never became active or stdout path missing"
+
+        # Write innocuous content — no rate-limit signature
+        stdout_path = Path(stdout_path_str)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"normal claude output, no rate limit\n")
+
+        fake_process.terminated = True
+
+        start = time.time()
+        req_thread.join(timeout=5.0)
+        elapsed = time.time() - start
+
+        assert not req_thread.is_alive(), "request did not complete after process death"
+        assert elapsed < 4.0, f"fast-fail too slow: {elapsed:.2f}s"
+        response = result_box.get("result", {}).get("response", "")
+        assert "exited unexpectedly" in response.lower(), (
+            f"expected generic exit message, got: {response!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_fast_fails_prefers_transcript_over_exit_msg(tmp_path, monkeypatch) -> None:
+    """When the Claude process dies on the same iteration that the transcript first shows a
+    complete end_turn response, _wait_for_response must return the transcript text rather
+    than the generic exit message.
+
+    This tests the 'transcript_response + end_turn' branch in the fast-fail block, which is
+    needed because transcript_fallback_response is only promoted after 0.5 s of stability —
+    it is still None on the very first iteration where a response appears.
+    """
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    # The transcript read always returns the completed response immediately
+    # (simulating: Claude wrote its answer and died in the same 0.5s window).
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: TranscriptResponse(text="THE-REAL-ANSWER", stop_reason="end_turn"),
+    )
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                break
+            time.sleep(0.05)
+
+        # Terminate process — death check should fire and prefer the transcript text
+        fake_process.terminated = True
+
+        req_thread.join(timeout=5.0)
+        assert not req_thread.is_alive(), "request did not complete"
+        response = result_box.get("result", {}).get("response", "")
+        assert response == "THE-REAL-ANSWER", (
+            f"expected transcript text, got: {response!r}"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_response_no_false_positive_while_process_alive(tmp_path, monkeypatch) -> None:
+    """The fast-fail death check must NOT fire while the process is alive.
+    A live process should allow the request to complete normally via the Stop hook.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 10,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=12,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        session_id = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                session_id = sessions[0]["session_id"]
+                break
+            time.sleep(0.05)
+        assert session_id is not None, "request never became active"
+
+        # Verify: with a live process, the death check must not fire.
+        # Wait for ~1.5 s (3 loop iterations at 0.5s each) and confirm the
+        # request is still pending — it should only complete on the Stop hook.
+        time.sleep(1.5)
+        assert req_thread.is_alive(), (
+            "fast-fail fired on a live process (false positive)"
+        )
+
+        # Complete normally via Stop hook
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": session_id, "response": "ALIVE-OK", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3.0)
+        assert not req_thread.is_alive(), "request did not complete after Stop hook"
+        assert result_box.get("result", {}).get("response") == "ALIVE-OK"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rate_limit_hook_completes_active_request(tmp_path, monkeypatch) -> None:
+    """POST /hook/rate-limit completes the active request with a rate-limit error
+    message immediately, without waiting for the process to die or Stop hook to fire.
+    The session stays alive (process is NOT killed) — this models the real scenario
+    where Claude Code remains running after the TUI is dismissed.
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for the request to become active
+        route_key = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                route_key = sessions[0].get("route_key")
+                break
+            time.sleep(0.05)
+        assert route_key is not None, "request never became active"
+
+        # Simulate drain thread: POST /hook/rate-limit (process stays alive)
+        hook_result = request_json(
+            "POST",
+            f"{address}/hook/rate-limit",
+            {"route_key": route_key},
+        )
+        assert hook_result.get("ok") is True
+
+        # Request should complete immediately with a rate-limit message
+        start = time.time()
+        req_thread.join(timeout=5.0)
+        elapsed = time.time() - start
+
+        assert not req_thread.is_alive(), "request did not complete after rate-limit hook"
+        assert elapsed < 4.0, f"rate-limit hook too slow: {elapsed:.2f}s"
+        response = result_box.get("result", {}).get("response", "")
+        assert "limit" in response.lower(), f"expected rate-limit message, got: {response!r}"
+
+        # Process is still alive — session should survive
+        assert fake_process.terminated is False, "process must not be killed by rate-limit hook"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rate_limit_hook_idempotent_when_no_active_request(tmp_path, monkeypatch) -> None:
+    """POST /hook/rate-limit is idempotent in two distinct cases:
+    1. Route key doesn't exist (no_session).
+    2. Session exists but has no active request (e.g. Stop hook already completed it).
+    """
+    monkeypatch.setattr(
+        "poor_claude.control_server.read_response_record_after_request_from_file",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setenv("POOR_CLAUDE_STALL_SECONDS", "0")
+
+    state = ControlState(state_dir=tmp_path / "state")
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+
+    try:
+        # Case 1: route key doesn't exist → no_session
+        result = request_json(
+            "POST",
+            f"{address}/hook/rate-limit",
+            {"route_key": "nonexistent::route"},
+        )
+        assert result.get("ok") is True
+        assert result.get("no_session") is True
+
+        # Case 2: session exists, request was completed by Stop hook, no active request
+        result_box: dict = {}
+
+        def send_request() -> None:
+            result_box["result"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "do work",
+                    "timeout_seconds": 30,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                },
+                timeout=10,
+            )
+
+        req_thread = threading.Thread(target=send_request, daemon=True)
+        req_thread.start()
+
+        # Wait for request to become active and grab route_key
+        route_key = None
+        for _ in range(80):
+            listed = request_json("GET", f"{address}/sessions")
+            sessions = listed.get("sessions", [])
+            if sessions and sessions[0].get("active_request") is not None:
+                route_key = sessions[0].get("route_key")
+                break
+            time.sleep(0.05)
+        assert route_key is not None, "request never became active"
+
+        # Stop hook completes the request first
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "response": "done", "cwd": str(tmp_path)},
+        )
+        req_thread.join(timeout=3.0)
+        assert not req_thread.is_alive()
+
+        # Now fire the rate-limit hook — session has no active request
+        result = request_json(
+            "POST",
+            f"{address}/hook/rate-limit",
+            {"route_key": route_key},
+        )
+        assert result.get("ok") is True
+        assert result.get("no_active_request") is True
     finally:
         server.shutdown()
         server.server_close()

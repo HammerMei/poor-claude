@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -13,6 +14,7 @@ from poor_claude.config import resolve_timeout, resolve_ttl
 from poor_claude.daemon import default_state_path, discover_state, start_daemon
 from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.prompt import PromptError, resolve_prompt
+from poor_claude.transcript import transcript_candidates
 
 
 RESUME_PICKER_SENTINEL = "__poor_claude_resume_picker__"
@@ -61,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sessions", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--prune-sessions", action="store_true")
+    parser.add_argument("--view", metavar="SESSION_ID",
+        help="Print the conversation transcript for a session to stdout")
+    parser.add_argument("--with-tools", action="store_true",
+        help="Include tool calls and results when using --view")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--launch-process", action="store_true")
     parser.set_defaults(auto_accept_startup_prompts=True)
@@ -106,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions, args.prune_sessions]
+    control_commands = [args.start_session, args.stop_session, args.shutdown, args.sessions, args.prune_sessions, args.view]
     needs_prompt = not any(control_commands)
     resolved = None
     if needs_prompt or args.dry_run:
@@ -165,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
                 count = len(removed) if isinstance(removed, list) else 0
                 print(f"Pruned {count} session(s).")
             return 0
+
+        if args.view:
+            printed = _view_session(args.view, workdir=args.workdir, with_tools=args.with_tools)
+            return 0 if printed else 1
 
         if args.stop_session:
             if not target_session_id:
@@ -318,6 +328,140 @@ def _format_sessions(sessions: object) -> str:
     for row in rows:
         lines.append("  ".join(row[header].ljust(widths[header]) for header in headers))
     return "\n".join(lines)
+
+
+# ── session transcript viewer ──────────────────────────────────────────────────
+
+_CHANNEL_PROMPT_RE = re.compile(
+    r"USER PROMPT:\n(.*?)(?:\n</poor-claude-request>|$)",
+    re.DOTALL,
+)
+_CHANNEL_WRAPPER_RE = re.compile(r'<channel source="poor-claude"[^>]*>.*?</channel>', re.DOTALL)
+
+
+def _extract_prompt(content: str | list) -> str | None:
+    """Pull the actual user prompt out of the poor-claude channel wrapper.
+
+    Returns the raw prompt string, or None if the content contains no channel
+    message (e.g. it's purely tool_result blocks returned after a tool call).
+    """
+    if isinstance(content, list):
+        # Channel messages are delivered as a tool_result block whose inner
+        # content is the XML-wrapped prompt string.
+        texts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_result":
+                    inner = block.get("content", "")
+                    if isinstance(inner, list):
+                        inner = " ".join(b.get("text", "") for b in inner if isinstance(b, dict))
+                    texts.append(str(inner))
+                elif block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+        content = "\n".join(texts)
+    if not isinstance(content, str):
+        return None
+    m = _CHANNEL_PROMPT_RE.search(content)
+    if m:
+        return m.group(1).strip()
+    # Not a channel message — check if there's any non-wrapper text.
+    stripped = _CHANNEL_WRAPPER_RE.sub("", content).strip()
+    return stripped or None
+
+
+def _extract_tool_results(content: str | list) -> list[tuple[str, str]]:
+    """Return (tool_use_id, text) pairs from tool_result blocks in a user message."""
+    if not isinstance(content, list):
+        return []
+    results = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id", "")
+        inner = block.get("content", "")
+        if isinstance(inner, list):
+            text = "\n".join(b.get("text", "") for b in inner if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = str(inner) if inner else ""
+        # Skip if it's actually the channel message wrapper (not a tool result).
+        if "poor-claude-request" not in text:
+            results.append((tool_use_id, text))
+    return results
+
+
+def _extract_response(content: str | list, *, with_tools: bool = False) -> str:
+    """Extract the text (and optionally tool calls) from an assistant message."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text", "").strip()
+            if text:
+                parts.append(text)
+        elif block.get("type") == "tool_use" and with_tools:
+            name = block.get("name", "unknown")
+            inp = block.get("input", {})
+            parts.append(f"── Tool: {name} {'─' * max(0, 46 - len(name))}")
+            parts.append(json.dumps(inp, indent=2, ensure_ascii=False))
+        # Skip thinking blocks — they're internal reasoning, not the response.
+    return "\n".join(parts)
+
+
+def _view_session(session_id: str, *, workdir: str, with_tools: bool = False) -> bool:
+    """Print a human-readable transcript to stdout. Returns True if found."""
+    candidates = transcript_candidates(session_id=session_id, workdir=workdir)
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        print(f"No transcript found for session {session_id!r}", file=sys.stderr)
+        return False
+
+    turn = 0
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            msg_type = obj.get("type")
+            if msg_type == "user":
+                content = obj.get("message", {}).get("content", "")
+                prompt = _extract_prompt(content)
+                if prompt:
+                    turn += 1
+                    print(f"{'─' * 60}")
+                    print(f"[{turn}] USER")
+                    print(f"{'─' * 60}")
+                    print(prompt)
+                    print()
+                elif with_tools:
+                    tool_results = _extract_tool_results(content)
+                    for tool_use_id, text in tool_results:
+                        print(f"{'─' * 60}")
+                        print(f"TOOL RESULT  {tool_use_id}")
+                        print(f"{'─' * 60}")
+                        print(text)
+                        print()
+            elif msg_type == "assistant":
+                content = obj.get("message", {}).get("content", "")
+                response = _extract_response(content, with_tools=with_tools)
+                if response:
+                    print(f"{'─' * 60}")
+                    print(f"[{turn}] ASSISTANT")
+                    print(f"{'─' * 60}")
+                    print(response)
+                    print()
+    if turn == 0:
+        print(f"Transcript at {path} exists but contains no user/assistant turns.", file=sys.stderr)
+        return False
+    return True
 
 
 if __name__ == "__main__":  # pragma: no cover

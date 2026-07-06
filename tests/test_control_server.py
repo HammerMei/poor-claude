@@ -927,6 +927,49 @@ def test_control_server_completes_from_end_turn_transcript_before_timeout(tmp_pa
         server.server_close()
 
 
+def test_control_server_completes_from_rate_limit_transcript_without_end_turn(tmp_path, monkeypatch) -> None:
+    # Regression test for the 2026-07-06 lockup: Claude Code injects a synthetic
+    # assistant turn (stop_reason "stop_sequence", never "end_turn") when the org
+    # monthly spend limit is hit, and never fires the Stop hook for it. Before the
+    # fix, _wait_for_response's transcript fallback only completed on
+    # stop_reason == "end_turn", so the request — and the whole route — hung until
+    # the hard timeout with no way to self-recover once the limit reset. Confirmed
+    # live on the production daemon: active_request stayed non-None indefinitely
+    # for exactly this transcript shape.
+    server, address = start_test_server()
+    calls = {"count": 0}
+
+    def fake_read_response(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            return None
+        return TranscriptResponse(
+            "You've hit your org's monthly spend limit",
+            stop_reason="stop_sequence",
+            is_rate_limit_error=True,
+        )
+
+    monkeypatch.setattr("poor_claude.control_server.read_response_record_after_request_from_file", fake_read_response)
+    try:
+        result = request_json(
+            "POST",
+            f"{address}/requests",
+            {
+                "session_id": "demo",
+                "prompt": "hello",
+                "timeout_seconds": 10,
+                "workdir": str(tmp_path),
+                "wait_for_response": True,
+            },
+            timeout=5,
+        )
+        assert result["status"] == "completed"
+        assert result["response"] == "You've hit your org's monthly spend limit"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_accepts_duplicate_stop_hook_for_completed_request(tmp_path) -> None:
     server, address = start_test_server()
     try:

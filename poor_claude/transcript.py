@@ -32,6 +32,12 @@ _TASK_STATUS_TERMINAL_RE = re.compile(r"<status>(completed|killed|failed|stopped
 class TranscriptResponse:
     text: str
     stop_reason: str | None = None
+    # True when this response is a synthetic client-side error Claude Code injects
+    # in place of a real turn (observed for the org monthly-spend-limit 429, where
+    # stop_reason is "stop_sequence" rather than "end_turn" and no interactive
+    # /rate-limit-options TUI is ever shown). Treated as terminal by callers so a
+    # pending request doesn't wait forever for an end_turn that will never come.
+    is_rate_limit_error: bool = False
 
 
 def transcript_candidates(*, session_id: str, workdir: str, projects_dir: Path | None = None) -> list[Path]:
@@ -85,6 +91,7 @@ def read_response_record_after_request_from_file(
     seen_request = False
     latest_response = None
     latest_stop_reason = None
+    latest_is_rate_limit_error = False
     try:
         if start_offset > 0:
             lines = _read_from_offset(path, start_offset=start_offset).splitlines()
@@ -111,9 +118,16 @@ def read_response_record_after_request_from_file(
             latest_response = text
             stop_reason = message.get("stop_reason")
             latest_stop_reason = stop_reason if isinstance(stop_reason, str) else None
+            latest_is_rate_limit_error = (
+                event.get("isApiErrorMessage") is True and event.get("error") == "rate_limit"
+            )
     if latest_response is None:
         return None
-    return TranscriptResponse(text=latest_response, stop_reason=latest_stop_reason)
+    return TranscriptResponse(
+        text=latest_response,
+        stop_reason=latest_stop_reason,
+        is_rate_limit_error=latest_is_rate_limit_error,
+    )
 
 
 def _read_from_offset(path: Path, *, start_offset: int) -> str:

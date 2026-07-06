@@ -533,6 +533,7 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
 
         transcript_response = None
         transcript_stop_reason = None
+        transcript_is_rate_limit_error = False
         transcript_signature = None
         for candidate in candidates:
             transcript_record = read_response_record_after_request_from_file(
@@ -543,6 +544,7 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
             if transcript_record is not None:
                 transcript_response = transcript_record.text
                 transcript_stop_reason = transcript_record.stop_reason
+                transcript_is_rate_limit_error = transcript_record.is_rate_limit_error
                 try:
                     stat = candidate.stat()
                     transcript_signature = (str(candidate), stat.st_size, stat.st_mtime_ns, transcript_response)
@@ -561,7 +563,14 @@ def _wait_for_response(state: ControlState, session, request, *, timeout_seconds
                 pass
             else:
                 transcript_fallback_response = transcript_response
-                if transcript_stop_reason == "end_turn":
+                # Also finish on a synthetic rate-limit error turn (stop_reason is
+                # "stop_sequence", never "end_turn" — see is_rate_limit_error on
+                # TranscriptResponse). Claude Code injects this in place of a real
+                # completion when the org monthly spend limit is hit and never fires
+                # the Stop hook for it, so without this the request would otherwise
+                # wait forever for an end_turn that never arrives (confirmed live:
+                # active_request stayed non-None indefinitely for exactly this case).
+                if transcript_stop_reason == "end_turn" or transcript_is_rate_limit_error:
                     # Scan the transcript for background agents/tasks not registered via
                     # hooks (PostToolUse doesn't fire in bypassPermissions mode; Bash tasks
                     # have no SubagentStop equivalent).

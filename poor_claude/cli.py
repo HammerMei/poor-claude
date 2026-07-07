@@ -49,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Restrict built-in tool set (e.g. 'Bash' 'Edit'); use '' to disable all; may be repeated")
     parser.add_argument("--system-prompt")
     parser.add_argument("--append-system-prompt")
+    parser.add_argument(
+        "--append-system-prompt-file",
+        metavar="PATH",
+        help="Read the value for --append-system-prompt from a file instead of the "
+             "command line. Re-read on every invocation (not cached), so a caller "
+             "that mutates the file in place has the new content picked up on the "
+             "session's next request. Mutually exclusive with --append-system-prompt.",
+    )
     parser.add_argument("--allowed-tools", action="append", dest="allowed_tools", metavar="RULE",
                         help="Allow a tool rule (e.g. 'Bash(ls *)'); may be repeated")
     parser.add_argument("--disallowed-tools", action="append", dest="disallowed_tools", metavar="RULE",
@@ -89,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("bare -r/--resume picker is not supported; pass --resume <session-id>")
     if args.session_id and args.resume:
         parser.error("--session-id and --resume cannot be used together")
+    if args.append_system_prompt and args.append_system_prompt_file:
+        parser.error("--append-system-prompt and --append-system-prompt-file cannot be used together")
     target_session_id = args.session_id or args.resume
     if target_session_id is not None:
         try:
@@ -144,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        resolved_append_system_prompt = _resolve_append_system_prompt(args)
         state_path = default_state_path()
         if args.shutdown:
             state = discover_state(state_path)
@@ -207,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                     "add_dirs": args.add_dirs,
                     "tools": args.tools,
                     "system_prompt": args.system_prompt,
-                    "append_system_prompt": args.append_system_prompt,
+                    "append_system_prompt": resolved_append_system_prompt,
                     "allowed_tools": args.allowed_tools or [],
                     "disallowed_tools": args.disallowed_tools or [],
                 },
@@ -238,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                 "model": args.model,
                 "tools": args.tools,
                 "system_prompt": args.system_prompt,
-                "append_system_prompt": args.append_system_prompt,
+                "append_system_prompt": resolved_append_system_prompt,
                 "allowed_tools": args.allowed_tools or [],
                 "disallowed_tools": args.disallowed_tools or [],
             },
@@ -266,6 +277,26 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(diagnostics, dict):
                 print(_format_diagnostics(diagnostics), file=sys.stderr)
         return 1
+
+
+def _resolve_append_system_prompt(args: argparse.Namespace) -> str | None:
+    """Return the value for the append_system_prompt request field.
+
+    Reads --append-system-prompt-file fresh on every call rather than once at
+    startup. This mirrors the real `claude` CLI, which re-reads the file on each
+    invocation — and it's why a caller can mutate the file in place (e.g. ACG's
+    durable system-prompt delivery, agent-chat-gateway#58) and have poor-claude
+    notice on the session's next request: the existing soft-param comparison in
+    control_server.py (session.metadata["append_system_prompt"] vs the incoming
+    value) already restarts the persistent process when the *content* changes,
+    regardless of whether that content arrived inline or via a file path. Without
+    a fresh read here, an updated file would silently never reach a long-running
+    session.
+    """
+    if args.append_system_prompt_file:
+        with open(args.append_system_prompt_file, encoding="utf-8") as fh:
+            return fh.read()
+    return args.append_system_prompt
 
 
 def _uses_short_resume(argv: list[str]) -> bool:

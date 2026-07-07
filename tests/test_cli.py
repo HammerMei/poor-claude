@@ -109,6 +109,22 @@ def test_cli_rejects_session_id_and_resume(monkeypatch) -> None:
     assert exc.value.code == 2
 
 
+def test_cli_rejects_append_system_prompt_and_file_together(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("sys.stdin", FakeStdin("hello", is_tty=False))
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("from file", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "--dry-run",
+            "-p",
+            "--append-system-prompt",
+            "inline",
+            "--append-system-prompt-file",
+            str(prompt_file),
+        ])
+    assert exc.value.code == 2
+
+
 def test_cli_accepts_named_session_id(monkeypatch, capsys) -> None:
     monkeypatch.setattr("sys.stdin", FakeStdin("hello", is_tty=False))
     exit_code = cli.main(["--dry-run", "-p", "--session-id", "not-a-uuid"])
@@ -220,6 +236,56 @@ def test_cli_start_session_posts_expected_payload(monkeypatch, capsys) -> None:
     assert payload["session_id"] == "demo"
     assert payload["auto_accept_workspace_trust"] is False
     assert '"session_id": "demo"' in capsys.readouterr().out
+
+
+def test_cli_request_reads_append_system_prompt_file(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr("sys.stdin", FakeStdin(is_tty=True))
+    monkeypatch.setattr(cli, "default_state_path", lambda: "/tmp/daemon.json")
+    monkeypatch.setattr(cli, "start_daemon", lambda **kwargs: SimpleNamespace(address="http://daemon"))
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "request_json",
+        lambda method, url, payload=None, timeout=None, **kwargs: calls.append(payload)
+        or {"session_id": "demo", "response": "hello"},
+    )
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("identity header from file", encoding="utf-8")
+    assert cli.main(["-p", "prompt", "--append-system-prompt-file", str(prompt_file)]) == 0
+    assert calls[0]["append_system_prompt"] == "identity header from file"
+
+
+def test_cli_request_rereads_append_system_prompt_file_each_call(monkeypatch, capsys, tmp_path) -> None:
+    # The whole point of reading from a file (rather than caching the value once)
+    # is that a caller like ACG can mutate the file in place between calls — e.g.
+    # agent-chat-gateway#58's durable system-prompt delivery — and have poor-claude
+    # notice the new content on the session's next request.
+    monkeypatch.setattr("sys.stdin", FakeStdin(is_tty=True))
+    monkeypatch.setattr(cli, "default_state_path", lambda: "/tmp/daemon.json")
+    monkeypatch.setattr(cli, "start_daemon", lambda **kwargs: SimpleNamespace(address="http://daemon"))
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "request_json",
+        lambda method, url, payload=None, timeout=None, **kwargs: calls.append(payload)
+        or {"session_id": "demo", "response": "hello"},
+    )
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("version 1", encoding="utf-8")
+    assert cli.main(["-p", "prompt", "--append-system-prompt-file", str(prompt_file)]) == 0
+    prompt_file.write_text("version 2", encoding="utf-8")
+    assert cli.main(["-p", "prompt", "--append-system-prompt-file", str(prompt_file)]) == 0
+    assert [c["append_system_prompt"] for c in calls] == ["version 1", "version 2"]
+
+
+def test_cli_request_missing_append_system_prompt_file_fails_cleanly(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr("sys.stdin", FakeStdin(is_tty=True))
+    monkeypatch.setattr(cli, "default_state_path", lambda: "/tmp/daemon.json")
+    monkeypatch.setattr(cli, "start_daemon", lambda **kwargs: SimpleNamespace(address="http://daemon"))
+    missing = tmp_path / "does-not-exist.md"
+    assert cli.main(["-p", "prompt", "--append-system-prompt-file", str(missing)]) == 1
+    stderr = capsys.readouterr().err
+    assert "claude-no-p failed" in stderr
 
 
 def test_cli_request_outputs_stream_json(monkeypatch, capsys) -> None:

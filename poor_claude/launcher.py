@@ -35,7 +35,13 @@ class ClaudeLaunchSpec:
     auto_accept_workspace_trust: bool = False
     effort: str = "medium"
     model: str | None = None
-    append_system_prompt: str | None = None
+    # A path, not the raw content: passed to the real `claude` process as
+    # --append-system-prompt-file instead of inline --append-system-prompt so the
+    # (possibly large) merged channel-auth-fragment + caller-supplied content never
+    # goes through argv — avoiding both a `ps aux`-visible leak of that content and
+    # any OS argv-length limit. See _build_append_system_prompt / prepare_launch_spec
+    # for where this file gets written.
+    append_system_prompt_file: Path | None = None
     system_prompt: str | None = None
     tools: list[str] | None = None
     add_dirs: list[str] | None = None
@@ -89,9 +95,9 @@ def build_claude_command(spec: ClaudeLaunchSpec) -> list[str]:
     if spec.system_prompt:
         command.append("--system-prompt")
         command.append(spec.system_prompt)
-    if spec.append_system_prompt:
-        command.append("--append-system-prompt")
-        command.append(spec.append_system_prompt)
+    if spec.append_system_prompt_file:
+        command.append("--append-system-prompt-file")
+        command.append(str(spec.append_system_prompt_file))
     if spec.permission_mode and spec.permission_mode != "default":
         command.append("--permission-mode")
         command.append(spec.permission_mode)
@@ -225,6 +231,7 @@ def prepare_launch_spec(
     # launch. The file is rewritten on every request so rule changes take effect
     # immediately — the hook reads it fresh on each invocation, no restart needed.
     policy_file = route_dir / "tools-policy.json"
+    append_system_prompt_file = route_dir / "append-system-prompt.md"
     allowed_tools_raw = session.metadata.get("allowed_tools") or ""
     disallowed_tools_raw = session.metadata.get("disallowed_tools") or ""
     allow_rules: list[str] = json.loads(allowed_tools_raw) if allowed_tools_raw else []
@@ -232,6 +239,15 @@ def prepare_launch_spec(
     route_dir.mkdir(parents=True, exist_ok=True)
     policy_file.write_text(
         json.dumps({"allow": allow_rules, "disallow": disallow_rules}), encoding="utf-8"
+    )
+    # Rewritten on every launch (fresh content each time, same as policy_file above),
+    # so a soft-param change to append_system_prompt is reflected before the relaunch
+    # that change itself triggers. --append-system-prompt-file (not inline) keeps this
+    # content — which can be arbitrarily large and may contain sensitive
+    # identity/addressing rules — out of argv and out of `ps aux` output.
+    append_system_prompt_file.write_text(
+        _build_append_system_prompt(session.metadata.get("append_system_prompt") or None),
+        encoding="utf-8",
     )
     base_url = callback_base_url.rstrip("/")
     merged = write_merged_settings(
@@ -265,6 +281,7 @@ def prepare_launch_spec(
     )
     session.metadata["merged_settings_path"] = str(merged.path)
     session.metadata["policy_file"] = str(policy_file)
+    session.metadata["append_system_prompt_file"] = str(append_system_prompt_file)
     session.metadata["mcp_config_path"] = str(mcp_config_path)
     session.metadata["mcp_log_path"] = str(mcp_log_path)
     session.metadata["claude_stdout_path"] = str(stdout_path)
@@ -283,9 +300,7 @@ def prepare_launch_spec(
         auto_accept_workspace_trust=session.metadata.get("auto_accept_workspace_trust") == "True",
         effort=session.metadata.get("effort") or "medium",
         model=session.metadata.get("model") or None,
-        append_system_prompt=_build_append_system_prompt(
-            session.metadata.get("append_system_prompt") or None
-        ),
+        append_system_prompt_file=append_system_prompt_file,
         system_prompt=session.metadata.get("system_prompt") or None,
         tools=_parse_tools_metadata(session.metadata.get("tools") or ""),
         add_dirs=_parse_json_list_metadata(session.metadata.get("add_dirs") or ""),

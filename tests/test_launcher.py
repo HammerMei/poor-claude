@@ -133,7 +133,7 @@ def test_build_claude_command_omits_model_when_not_set() -> None:
     assert "--model" not in command
 
 
-def test_build_claude_command_appends_append_system_prompt_when_set() -> None:
+def test_build_claude_command_appends_append_system_prompt_file_when_set() -> None:
     command = build_claude_command(
         ClaudeLaunchSpec(
             session_id="demo",
@@ -141,14 +141,14 @@ def test_build_claude_command_appends_append_system_prompt_when_set() -> None:
             mcp_config_path=Path("/tmp/mcp.json"),
             channel_name="poor-claude",
             workdir=Path("/tmp"),
-            append_system_prompt="be concise",
+            append_system_prompt_file=Path("/tmp/route/append-system-prompt.md"),
         )
     )
-    assert "--append-system-prompt" in command
-    assert command[command.index("--append-system-prompt") + 1] == "be concise"
+    assert "--append-system-prompt-file" in command
+    assert command[command.index("--append-system-prompt-file") + 1] == "/tmp/route/append-system-prompt.md"
 
 
-def test_build_claude_command_omits_append_system_prompt_when_not_set() -> None:
+def test_build_claude_command_omits_append_system_prompt_file_when_not_set() -> None:
     command = build_claude_command(
         ClaudeLaunchSpec(
             session_id="demo",
@@ -158,7 +158,7 @@ def test_build_claude_command_omits_append_system_prompt_when_not_set() -> None:
             workdir=Path("/tmp"),
         )
     )
-    assert "--append-system-prompt" not in command
+    assert "--append-system-prompt-file" not in command
 
 
 def test_build_claude_command_passes_system_prompt_when_set() -> None:

@@ -179,6 +179,7 @@ tool call.
 | `--effort LEVEL` | `low`, `medium` (default), `high`, `xhigh`, `max` |
 | `--system-prompt TEXT` | Replace the default system prompt |
 | `--append-system-prompt TEXT` | Append to the default system prompt |
+| `--append-system-prompt-file PATH` | Same as above, read from a file. Re-read on every invocation, so mutating the file in place delivers new content on the session's next request. Mutually exclusive with `--append-system-prompt`. |
 | `--tools TOOL …` | Restrict built-in tool set (repeat for multiple; `""` = disable all) |
 | `--add-dir PATH` | Add a directory to Claude's tool access (repeat for multiple) |
 | `--settings FILE` | Path to a Claude settings JSON file |

@@ -1534,17 +1534,21 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
 
 
 def _owns_current_state(state_file: Path, pid: int) -> bool:
-    """True if state_file is missing or still records `pid` as its owner.
+    """True unless state_file positively records a *different* pid as owner.
 
-    Used to guard state-file deletion on shutdown: a daemon should only ever
-    delete the shared state file if it's still the one recorded there. If a
-    newer daemon has since overwritten it (e.g. this process was an orphaned
-    duplicate from a startup race), leave the file alone.
+    Used to guard state-file deletion on shutdown: a daemon should only skip
+    deleting the file when it can positively confirm a different, valid
+    daemon record has since claimed it (e.g. this process was an orphaned
+    duplicate from a startup race). A missing or unparseable file has no such
+    claim recorded — writes are atomic (write_state uses tmp-file + rename),
+    so a live daemon never leaves behind a torn/corrupt file — and is safe,
+    and worth, cleaning up rather than left to crash the next start_daemon()
+    call that tries to read it.
     """
     try:
         current = read_state(state_file)
     except (OSError, ValueError, KeyError, TypeError):
-        return False
+        return True
     return current is None or current.pid == pid
 
 

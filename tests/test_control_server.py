@@ -4456,13 +4456,16 @@ def test_owns_current_state_false_when_another_daemon_claimed_it(tmp_path) -> No
     assert state_file.exists()
 
 
-def test_owns_current_state_false_on_corrupt_file(tmp_path) -> None:
+def test_owns_current_state_true_on_corrupt_file(tmp_path) -> None:
+    """A corrupt file records no valid claim from another daemon, so it must
+    still be cleaned up on shutdown — otherwise it's left behind to crash the
+    next start_daemon() call's read instead of being treated as "no daemon"."""
     state_file = tmp_path / "daemon.json"
     state_file.write_text("not valid json", encoding="utf-8")
-    assert _owns_current_state(state_file, pid=1234) is False
+    assert _owns_current_state(state_file, pid=1234) is True
 
 
-def test_owns_current_state_false_on_wrong_field_type(tmp_path) -> None:
+def test_owns_current_state_true_on_wrong_field_type(tmp_path) -> None:
     state_file = tmp_path / "daemon.json"
     state_file.write_text('{"pid": null, "address": "http://127.0.0.1:1"}', encoding="utf-8")
-    assert _owns_current_state(state_file, pid=1234) is False
+    assert _owns_current_state(state_file, pid=1234) is True

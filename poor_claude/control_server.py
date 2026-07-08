@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from poor_claude.daemon import DaemonState, write_state
+from poor_claude.daemon import DaemonState, read_state, write_state
 from poor_claude.launcher import build_claude_command, cleanup_project_mcp_config, prepare_launch_spec
 from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
@@ -1533,6 +1533,21 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
+def _owns_current_state(state_file: Path, pid: int) -> bool:
+    """True if state_file is missing or still records `pid` as its owner.
+
+    Used to guard state-file deletion on shutdown: a daemon should only ever
+    delete the shared state file if it's still the one recorded there. If a
+    newer daemon has since overwritten it (e.g. this process was an orphaned
+    duplicate from a startup race), leave the file alone.
+    """
+    try:
+        current = read_state(state_file)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return current is None or current.pid == pid
+
+
 def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     state = ControlState(state_dir=state_file.parent)
     server = _FastBindHTTPServer((host, port), make_handler(state))
@@ -1543,7 +1558,13 @@ def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     write_state(state_file, DaemonState(pid=os.getpid(), address=address))
 
     def remove_state(*_: object) -> None:
-        state_file.unlink(missing_ok=True)
+        # Only remove the state file if it still points at this process. If a
+        # newer daemon has since claimed it (e.g. this instance was an
+        # orphaned duplicate from a startup race), deleting it here would
+        # wipe out the record of the daemon that's actually alive and serving
+        # requests.
+        if _owns_current_state(state_file, os.getpid()):
+            state_file.unlink(missing_ok=True)
 
     shutdown_signal = threading.Event()
 

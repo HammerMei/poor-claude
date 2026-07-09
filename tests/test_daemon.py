@@ -18,7 +18,33 @@ def test_discover_state_removes_stale_pid(tmp_path) -> None:
     path = tmp_path / "daemon.json"
     write_state(path, DaemonState(pid=999999999, address="127.0.0.1:1234"))
     assert discover_state(path) is None
-    assert not path.exists()
+
+
+def test_discover_state_treats_corrupt_file_as_no_daemon(tmp_path) -> None:
+    """Regression test: an unparseable state file must not crash discover_state
+    (and therefore every start_daemon()/CLI caller that goes through it) — it
+    should be treated the same as "no daemon running"."""
+    path = tmp_path / "daemon.json"
+    path.write_text("not valid json", encoding="utf-8")
+    assert discover_state(path) is None
+
+
+def test_discover_state_does_not_delete_corrupt_file(tmp_path) -> None:
+    """Regression test: unlike the stale-pid case, discover_state() must NOT
+    delete a corrupt file itself — this runs with no lock held, so deleting
+    here could race a concurrent daemon's just-written valid state. It's fine
+    to leave it: the next successful spawn's write_state() atomically
+    overwrites it."""
+    path = tmp_path / "daemon.json"
+    path.write_text("not valid json", encoding="utf-8")
+    discover_state(path)
+    assert path.exists()
+
+
+def test_discover_state_wrong_field_type_treated_as_no_daemon(tmp_path) -> None:
+    path = tmp_path / "daemon.json"
+    path.write_text('{"pid": null, "address": "http://127.0.0.1:1"}', encoding="utf-8")
+    assert discover_state(path) is None
 
 
 def test_start_daemon_serializes_concurrent_callers(tmp_path, monkeypatch) -> None:

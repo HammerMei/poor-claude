@@ -46,7 +46,17 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def discover_state(path: Path) -> DaemonState | None:
-    state = read_state(path)
+    try:
+        state = read_state(path)
+    except (OSError, ValueError, KeyError, TypeError):
+        # Unparseable state file: treat like "no daemon" rather than crashing
+        # every caller (e.g. start_daemon()). Deliberately do NOT unlink here —
+        # this runs with no lock held, so deleting could race a concurrent
+        # daemon's just-written, valid state (the same class of bug the
+        # start_daemon() flock and _owns_current_state() guard against
+        # elsewhere). Leaving it is harmless: the next successful spawn's
+        # write_state() atomically overwrites it anyway.
+        return None
     if state is None:
         return None
     if not is_pid_alive(state.pid):

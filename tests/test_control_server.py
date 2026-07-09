@@ -3,7 +3,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from poor_claude.control_server import ControlState, _owns_current_state, make_handler
+from poor_claude.control_server import ControlState, _safe_to_delete_state_file, make_handler
 from poor_claude.daemon import DaemonState, write_state
 from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.transcript import TranscriptResponse
@@ -4431,18 +4431,18 @@ def test_rate_limit_hook_idempotent_when_no_active_request(tmp_path, monkeypatch
         server.server_close()
 
 
-def test_owns_current_state_true_when_file_missing(tmp_path) -> None:
+def test_safe_to_delete_state_file_true_when_file_missing(tmp_path) -> None:
     state_file = tmp_path / "daemon.json"
-    assert _owns_current_state(state_file, pid=1234) is True
+    assert _safe_to_delete_state_file(state_file, pid=1234) is True
 
 
-def test_owns_current_state_true_when_pid_matches(tmp_path) -> None:
+def test_safe_to_delete_state_file_true_when_pid_matches(tmp_path) -> None:
     state_file = tmp_path / "daemon.json"
     write_state(state_file, DaemonState(pid=1234, address="http://127.0.0.1:1"))
-    assert _owns_current_state(state_file, pid=1234) is True
+    assert _safe_to_delete_state_file(state_file, pid=1234) is True
 
 
-def test_owns_current_state_false_when_another_daemon_claimed_it(tmp_path) -> None:
+def test_safe_to_delete_state_file_false_when_another_daemon_claimed_it(tmp_path) -> None:
     """Regression test: a shutting-down daemon must not delete the state file
     once a different (e.g. newer) daemon has recorded itself as the owner —
     doing so was observed to wipe out the record of a healthy, still-running
@@ -4451,21 +4451,21 @@ def test_owns_current_state_false_when_another_daemon_claimed_it(tmp_path) -> No
     write_state(state_file, DaemonState(pid=1234, address="http://127.0.0.1:1"))
     # A different daemon (e.g. the survivor of a startup race) claims the file.
     write_state(state_file, DaemonState(pid=5678, address="http://127.0.0.1:2"))
-    assert _owns_current_state(state_file, pid=1234) is False
+    assert _safe_to_delete_state_file(state_file, pid=1234) is False
     # And the file must be left intact for the real owner to keep using.
     assert state_file.exists()
 
 
-def test_owns_current_state_true_on_corrupt_file(tmp_path) -> None:
+def test_safe_to_delete_state_file_true_on_corrupt_file(tmp_path) -> None:
     """A corrupt file records no valid claim from another daemon, so it must
     still be cleaned up on shutdown — otherwise it's left behind to crash the
     next start_daemon() call's read instead of being treated as "no daemon"."""
     state_file = tmp_path / "daemon.json"
     state_file.write_text("not valid json", encoding="utf-8")
-    assert _owns_current_state(state_file, pid=1234) is True
+    assert _safe_to_delete_state_file(state_file, pid=1234) is True
 
 
-def test_owns_current_state_true_on_wrong_field_type(tmp_path) -> None:
+def test_safe_to_delete_state_file_true_on_wrong_field_type(tmp_path) -> None:
     state_file = tmp_path / "daemon.json"
     state_file.write_text('{"pid": null, "address": "http://127.0.0.1:1"}', encoding="utf-8")
-    assert _owns_current_state(state_file, pid=1234) is True
+    assert _safe_to_delete_state_file(state_file, pid=1234) is True

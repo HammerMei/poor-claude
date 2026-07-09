@@ -1533,17 +1533,17 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
-def _owns_current_state(state_file: Path, pid: int) -> bool:
-    """True unless state_file positively records a *different* pid as owner.
+def _safe_to_delete_state_file(state_file: Path, pid: int) -> bool:
+    """False only when state_file positively records a different, valid pid.
 
-    Used to guard state-file deletion on shutdown: a daemon should only skip
-    deleting the file when it can positively confirm a different, valid
-    daemon record has since claimed it (e.g. this process was an orphaned
-    duplicate from a startup race). A missing or unparseable file has no such
-    claim recorded — writes are atomic (write_state uses tmp-file + rename),
-    so a live daemon never leaves behind a torn/corrupt file — and is safe,
-    and worth, cleaning up rather than left to crash the next start_daemon()
-    call that tries to read it.
+    True for a missing, corrupt/unparseable, or self-owned file: corruption
+    is always safe to clear because write_state() is atomic (tmp-file +
+    rename), so a live daemon never leaves behind a torn/corrupt file — an
+    unparseable file was never a valid owner's record in the first place.
+    False is the one case that matters: a different, valid daemon record —
+    e.g. this process was an orphaned duplicate from a startup race — must
+    not be deleted out from under the daemon that's actually alive and
+    serving requests.
     """
     try:
         current = read_state(state_file)
@@ -1562,12 +1562,7 @@ def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     write_state(state_file, DaemonState(pid=os.getpid(), address=address))
 
     def remove_state(*_: object) -> None:
-        # Only remove the state file if it still points at this process. If a
-        # newer daemon has since claimed it (e.g. this instance was an
-        # orphaned duplicate from a startup race), deleting it here would
-        # wipe out the record of the daemon that's actually alive and serving
-        # requests.
-        if _owns_current_state(state_file, os.getpid()):
+        if _safe_to_delete_state_file(state_file, os.getpid()):
             state_file.unlink(missing_ok=True)
 
     shutdown_signal = threading.Event()

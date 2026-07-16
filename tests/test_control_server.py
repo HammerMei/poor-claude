@@ -3,7 +3,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from poor_claude.control_server import ControlState, _safe_to_delete_state_file, make_handler
+from poor_claude.control_server import ControlState, _safe_to_delete_state_file, _settings_fingerprint, make_handler
 from poor_claude.daemon import DaemonState, write_state
 from poor_claude.http_client import HttpClientError, request_json
 from poor_claude.transcript import TranscriptResponse
@@ -342,8 +342,13 @@ def test_control_server_rejected_config_mismatch_does_not_flip_resume_mode(tmp_p
     server, address = start_test_server()
     first_settings = tmp_path / "one.json"
     second_settings = tmp_path / "two.json"
+    # Deliberately different content: the mismatch check compares settings
+    # file content (fingerprint), not the path string, so same-content files
+    # at different paths must NOT be treated as a mismatch (see the
+    # settings_path_fingerprint tests below) — this test needs genuinely
+    # different content to still exercise the real-mismatch path.
     first_settings.write_text('{"hooks": {}}', encoding="utf-8")
-    second_settings.write_text('{"hooks": {}}', encoding="utf-8")
+    second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
     try:
         request_json(
             "POST",
@@ -1451,8 +1456,10 @@ def test_control_server_rejects_launch_config_mismatch(tmp_path) -> None:
     try:
         first_settings = tmp_path / "one.json"
         second_settings = tmp_path / "two.json"
+        # Deliberately different content — see comment in
+        # test_control_server_rejected_config_mismatch_does_not_flip_resume_mode.
         first_settings.write_text('{"hooks": {}}', encoding="utf-8")
-        second_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
         request_json(
             "POST",
             f"{address}/sessions",
@@ -1476,6 +1483,70 @@ def test_control_server_rejects_launch_config_mismatch(tmp_path) -> None:
             )
         except Exception as exc:
             assert "launch config differs" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected launch config mismatch")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_allows_settings_path_change_with_identical_content(tmp_path) -> None:
+    """Regression test: a caller that regenerates its --settings file at a new
+    path on every restart (e.g. a fresh temp file with a random suffix) must
+    not trip the launch-config-frozen mismatch check as long as the file's
+    actual content is unchanged — only the path differs. Reproduces a real
+    incident where ACG restarting caused every subsequent request to a live
+    session to fail with "existing session launch config differs"."""
+    server, address = start_test_server()
+    try:
+        first_settings = tmp_path / "acg-claude-settings-thpg3ii3.json"
+        second_settings = tmp_path / "acg-claude-settings-kbse3yqn.json"
+        identical_content = '{"hooks": {"Stop": []}}'
+        first_settings.write_text(identical_content, encoding="utf-8")
+        second_settings.write_text(identical_content, encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(first_settings)},
+        )
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(second_settings)},
+        )
+        listed = request_json("GET", f"{address}/sessions")
+        # The stored path should have been refreshed to the new (still-valid)
+        # path so a later re-read doesn't reference a file that may later be
+        # cleaned up by the caller.
+        assert listed["sessions"][0]["metadata"]["settings_path"] == str(second_settings)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_rejects_settings_path_change_with_different_content(tmp_path) -> None:
+    """Content still matters: if the new path's content genuinely differs,
+    the mismatch must still be rejected — the fingerprint fix must not make
+    this check toothless."""
+    server, address = start_test_server()
+    try:
+        first_settings = tmp_path / "acg-claude-settings-thpg3ii3.json"
+        second_settings = tmp_path / "acg-claude-settings-kbse3yqn.json"
+        first_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(first_settings)},
+        )
+        try:
+            request_json(
+                "POST",
+                f"{address}/sessions",
+                {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(second_settings)},
+            )
+        except HttpClientError as exc:
+            assert "existing session launch config differs" in str(exc)
         else:  # pragma: no cover
             raise AssertionError("expected launch config mismatch")
     finally:
@@ -4469,3 +4540,32 @@ def test_safe_to_delete_state_file_true_on_wrong_field_type(tmp_path) -> None:
     state_file = tmp_path / "daemon.json"
     state_file.write_text('{"pid": null, "address": "http://127.0.0.1:1"}', encoding="utf-8")
     assert _safe_to_delete_state_file(state_file, pid=1234) is True
+
+
+def test_settings_fingerprint_empty_path_returns_empty_string() -> None:
+    assert _settings_fingerprint("") == ""
+
+
+def test_settings_fingerprint_same_content_different_path_matches(tmp_path) -> None:
+    first = tmp_path / "one.json"
+    second = tmp_path / "two.json"
+    first.write_text('{"hooks": {}}', encoding="utf-8")
+    second.write_text('{"hooks": {}}', encoding="utf-8")
+    assert _settings_fingerprint(str(first)) == _settings_fingerprint(str(second))
+
+
+def test_settings_fingerprint_different_content_differs(tmp_path) -> None:
+    first = tmp_path / "one.json"
+    second = tmp_path / "two.json"
+    first.write_text('{"hooks": {}}', encoding="utf-8")
+    second.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+    assert _settings_fingerprint(str(first)) != _settings_fingerprint(str(second))
+
+
+def test_settings_fingerprint_missing_file_falls_back_to_path(tmp_path) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    fingerprint = _settings_fingerprint(str(missing))
+    assert fingerprint == f"unreadable:{missing}"
+    # Two different missing paths must not collide with each other.
+    other_missing = tmp_path / "also-missing.json"
+    assert _settings_fingerprint(str(other_missing)) != fingerprint

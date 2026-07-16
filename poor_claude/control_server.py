@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -58,6 +59,29 @@ def _canonical_session_id(value: Any) -> str | None:
         return value
 
 
+def _settings_fingerprint(path_str: str) -> str:
+    """Fingerprint a --settings file by its content, not its path.
+
+    Some callers (e.g. a client that regenerates a temp settings file at a
+    new random path every time it restarts) pass a different path on every
+    request even when the file's actual contents haven't changed. Comparing
+    raw path strings then falsely flags this as a launch-config change and
+    rejects an otherwise-identical request against an already-running
+    session. Hashing the content instead means only a real settings change
+    trips the mismatch check in _apply_launch_metadata().
+    """
+    if not path_str:
+        return ""
+    try:
+        content = Path(path_str).read_bytes()
+    except OSError:
+        # Unreadable/missing file: fall back to the path itself so this
+        # still participates in mismatch detection instead of silently
+        # matching every unreadable path against every other one.
+        return f"unreadable:{path_str}"
+    return hashlib.sha256(content).hexdigest()
+
+
 def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     """Record immutable launch-affecting metadata for a session route.
 
@@ -66,6 +90,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     _VALID_PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
     incoming_settings = payload.get("settings_path")
     incoming_settings = incoming_settings if isinstance(incoming_settings, str) else ""
+    incoming_settings_fingerprint = _settings_fingerprint(incoming_settings)
     # --dangerously-skip-permissions is a legacy alias for --permission-mode bypassPermissions
     incoming_permission_mode = payload.get("permission_mode") or (
         "bypassPermissions" if payload.get("dangerously_skip_permissions") else "default"
@@ -108,6 +133,11 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
         raise RuntimeError("poor-claude requires development channels for interactive routing")
 
     existing_settings = session.metadata.get("settings_path", "")
+    # Fingerprint by content rather than comparing existing_settings/incoming_settings
+    # path strings directly: computed fresh from whatever path is currently on
+    # record, so an already-frozen session from before this fingerprinting was
+    # added upgrades transparently (no stored fingerprint to migrate).
+    existing_settings_fingerprint = _settings_fingerprint(existing_settings)
     existing_permission_mode = session.metadata.get("permission_mode") or "default"
     existing_dev_channels = _bool_metadata(
         session.metadata.get("dangerously_load_development_channels", "True")
@@ -124,7 +154,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
 
     if "launch_config_frozen" in session.metadata:
         mismatches = []
-        if existing_settings != incoming_settings:
+        if existing_settings_fingerprint != incoming_settings_fingerprint:
             mismatches.append(f"settings_path existing={existing_settings!r} incoming={incoming_settings!r}")
         if existing_permission_mode != incoming_permission_mode:
             mismatches.append(
@@ -140,6 +170,13 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
                 "existing session launch config differs from request; stop/recreate session or use matching flags: "
                 + "; ".join(mismatches)
             )
+        if existing_settings != incoming_settings:
+            # Content matched (fingerprints equal) but the path itself moved —
+            # e.g. a caller that regenerates its temp settings file at a new
+            # path on every restart. Track the new path so a later re-read
+            # (prepare_launch_spec, or the next comparison) doesn't reference
+            # a stale path that may no longer exist.
+            session.metadata["settings_path"] = incoming_settings
         if incoming_resume:
             session.metadata["resume_on_launch"] = "True"
         if existing_auto_trust != incoming_auto_trust:

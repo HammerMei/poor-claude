@@ -173,9 +173,13 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
                 if stale_fingerprint.startswith("unreadable:")
                 else stale_fingerprint
             )
+        # settings_path content is a SOFT field (handled below, alongside
+        # effort/model/etc.) — a genuine content change triggers a process
+        # restart instead of rejecting the request outright. permission_mode
+        # and dangerously_load_development_channels stay HARD: those are
+        # security-relevant and must not silently change under a live
+        # session, so a mismatch there still raises.
         mismatches = []
-        if cached_settings_fingerprint != incoming_settings_fingerprint:
-            mismatches.append(f"settings_path existing={existing_settings!r} incoming={incoming_settings!r}")
         if existing_permission_mode != incoming_permission_mode:
             mismatches.append(
                 f"permission_mode existing={existing_permission_mode!r} incoming={incoming_permission_mode!r}"
@@ -190,17 +194,20 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
                 "existing session launch config differs from request; stop/recreate session or use matching flags: "
                 + "; ".join(mismatches)
             )
+        settings_changed = cached_settings_fingerprint != incoming_settings_fingerprint
         if existing_settings != incoming_settings:
-            # Content matched (fingerprints equal) but the path itself moved —
-            # e.g. a caller that regenerates its temp settings file at a new
-            # path on every restart. Track the new path so a later re-read
-            # (prepare_launch_spec, or the next comparison) doesn't reference
-            # a stale path that may no longer exist.
+            # Path moved — either a genuine content change (settings_changed,
+            # triggers a soft restart below so the new content actually reaches
+            # the relaunched process) or just a caller regenerating its temp
+            # settings file at a new path with identical content. Either way,
+            # track the new path so a later re-read (prepare_launch_spec, or
+            # the next comparison) doesn't reference a stale path that may no
+            # longer exist.
             session.metadata["settings_path"] = incoming_settings
         # Always keep the cached fingerprint in sync with the incoming
-        # (verified-matching) value — not just existing_settings/path above —
-        # so the NEXT comparison never has to re-read a path that the caller
-        # may have since deleted.
+        # (verified) value — not just existing_settings/path above — so the
+        # NEXT comparison never has to re-read a path that the caller may
+        # have since deleted.
         session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
         if incoming_resume:
             session.metadata["resume_on_launch"] = "True"
@@ -214,8 +221,13 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
             session.metadata["allowed_tools"] = incoming_allowed_tools
         if existing_disallowed_tools != incoming_disallowed_tools:
             session.metadata["disallowed_tools"] = incoming_disallowed_tools
-        # Soft params (effort, model, system_prompt, append_system_prompt) require a
-        # process restart so the new values are included in the claude command arguments.
+        # Soft params (effort, model, system_prompt, append_system_prompt, and now
+        # settings content) require a process restart so the new values are
+        # included in the claude command arguments / merged settings file. This
+        # is what lets a session self-heal from a caller-side infra change (e.g.
+        # ACG regenerating its settings file with a new permission-hook port on
+        # restart) instead of every subsequent request failing with a hard
+        # "config mismatch" until the session is manually recreated.
         soft_changed = (
             existing_effort != incoming_effort
             or existing_model != incoming_model
@@ -223,6 +235,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
             or existing_add_dirs != incoming_add_dirs
             or existing_system_prompt != incoming_system_prompt
             or existing_append_system_prompt != incoming_append_system_prompt
+            or settings_changed
         )
         if soft_changed:
             session.metadata["effort"] = incoming_effort

@@ -1524,6 +1524,117 @@ def test_control_server_restarts_process_on_settings_content_change(tmp_path) ->
         server.server_close()
 
 
+def test_control_server_restarts_on_settings_change_via_requests_path(tmp_path) -> None:
+    """The propagation test above goes through POST /sessions, which has NO
+    busy-guard. The CLI's actual default path for sending a prompt (what ACG
+    invokes on every message) is POST /requests with launch_process=True —
+    which DOES have a guard that skips the restart while another request is
+    active/queued (see the "session is busy" RuntimeError a few lines above
+    _ensure_process_metadata in _handle_request). That guard checks
+    session.active_request/pending_request_queue BEFORE the incoming request
+    is itself enqueued, so it must not self-trip on the very request that
+    carries the settings change — a single ordinary message right after ACG
+    restarts must self-heal on the first try, not bounce with "session is
+    busy" and require a retry. This exercises that exact path end to end."""
+    state = ControlState()
+    first_process = FakeProcess()
+    second_process = FakeProcess()
+    second_process.pid = 5000
+    launched = [first_process, second_process]
+    state.process_manager._launch_fn = lambda _spec: launched.pop(0)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+    try:
+        first_settings = tmp_path / "acg-claude-settings-thpg3ii3.json"
+        second_settings = tmp_path / "acg-claude-settings-kbse3yqn.json"
+        first_settings.write_text(
+            '{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", '
+            '"command": "curl http://127.0.0.1:56453/hook"}]}]}}',
+            encoding="utf-8",
+        )
+        second_settings.write_text(
+            '{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", '
+            '"command": "curl http://127.0.0.1:56455/hook"}]}]}}',
+            encoding="utf-8",
+        )
+
+        def send(prompt: str, settings_path, box: dict, key: str) -> None:
+            box[key] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": prompt,
+                    "timeout_seconds": 5,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                    "settings_path": str(settings_path),
+                },
+            )
+
+        def wait_for_active_and_complete(response_text: str) -> None:
+            deadline = time.monotonic() + 3
+            listed = None
+            while time.monotonic() < deadline:
+                listed = request_json("GET", f"{address}/sessions")
+                if listed["sessions"] and listed["sessions"][0]["active_request"] is not None:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(
+                    "request never became active within 3s "
+                    "(e.g. it was rejected by the busy guard instead of enqueued)"
+                )
+            active_request = listed["sessions"][0]["active_request"]
+            request_json(
+                "POST",
+                f"{address}/hook/stop",
+                {
+                    "session_id": "demo",
+                    "request_id": active_request,
+                    "response": response_text,
+                    "cwd": str(tmp_path),
+                },
+            )
+
+        # First message: session created, process launched with first_settings.
+        result_box: dict = {}
+        t1 = threading.Thread(target=send, args=("hello", first_settings, result_box, "first"))
+        t1.start()
+        wait_for_active_and_complete("hi")
+        t1.join(timeout=3)
+        assert result_box["first"]["status"] == "completed"
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["metadata"]["process_pid"] == "4242"
+
+        # Second message: simulate ACG restarting mid-conversation — same
+        # session, new settings file, genuinely different content — sent as
+        # a normal single in-flight prompt exactly like the CLI's default
+        # path. Must succeed and self-heal on THIS request, not error with
+        # "session is busy".
+        result_box2: dict = {}
+        t2 = threading.Thread(target=send, args=("hello again", second_settings, result_box2, "second"))
+        t2.start()
+        wait_for_active_and_complete("hi again")
+        t2.join(timeout=3)
+        assert result_box2["second"]["status"] == "completed", result_box2["second"]
+
+        assert first_process.terminated is True, "old process must be stopped before relaunch"
+        listed = request_json("GET", f"{address}/sessions")
+        metadata = listed["sessions"][0]["metadata"]
+        assert metadata["process_pid"] == "5000", "a genuinely new process must be launched"
+        merged_content = Path(metadata["merged_settings_path"]).read_text(encoding="utf-8")
+        assert "56455" in merged_content
+        assert "56453" not in merged_content
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_allows_settings_path_change_with_identical_content(tmp_path) -> None:
     """Regression test: a caller that regenerates its --settings file at a new
     path on every restart (e.g. a fresh temp file with a random suffix) must

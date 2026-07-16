@@ -1524,6 +1524,83 @@ def test_control_server_allows_settings_path_change_with_identical_content(tmp_p
         server.server_close()
 
 
+def test_control_server_allows_settings_path_change_after_old_file_deleted(tmp_path) -> None:
+    """Regression test for a live incident: the caller regenerates its
+    --settings temp file on every restart AND deletes the previous one soon
+    after. If the fingerprint were recomputed from the stored path on every
+    call, the deleted old file would hit the "unreadable" fallback and
+    permanently mismatch every future request, even though content never
+    changed. The fingerprint must instead be cached at write time so a later
+    comparison never needs to re-read a path the caller has since removed."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        first_settings = tmp_path / "acg-claude-settings-thpg3ii3.json"
+        second_settings = tmp_path / "acg-claude-settings-kbse3yqn.json"
+        identical_content = '{"hooks": {"Stop": []}}'
+        first_settings.write_text(identical_content, encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(first_settings)},
+        )
+        # Simulate the caller cleaning up its own old temp file before the
+        # next restart sends a new one.
+        first_settings.unlink()
+        second_settings.write_text(identical_content, encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(second_settings)},
+        )
+        listed = request_json("GET", f"{address}/sessions")
+        assert listed["sessions"][0]["metadata"]["settings_path"] == str(second_settings)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_migrates_pre_fingerprint_session_when_old_file_readable(tmp_path) -> None:
+    """A session frozen before settings_fingerprint metadata existed has no
+    cached value yet. If its recorded settings_path is still readable, the
+    migration must fingerprint it and still catch a genuine content change."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        first_settings = tmp_path / "one.json"
+        second_settings = tmp_path / "two.json"
+        first_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(first_settings)},
+        )
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            del session.metadata["settings_fingerprint"]  # simulate a pre-upgrade session
+        try:
+            request_json(
+                "POST",
+                f"{address}/sessions",
+                {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(second_settings)},
+            )
+        except HttpClientError as exc:
+            assert "existing session launch config differs" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected launch config mismatch")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_rejects_settings_path_change_with_different_content(tmp_path) -> None:
     """Content still matters: if the new path's content genuinely differs,
     the mismatch must still be rejected — the fingerprint fix must not make

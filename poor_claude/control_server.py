@@ -133,11 +133,17 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
         raise RuntimeError("poor-claude requires development channels for interactive routing")
 
     existing_settings = session.metadata.get("settings_path", "")
-    # Fingerprint by content rather than comparing existing_settings/incoming_settings
-    # path strings directly: computed fresh from whatever path is currently on
-    # record, so an already-frozen session from before this fingerprinting was
-    # added upgrades transparently (no stored fingerprint to migrate).
-    existing_settings_fingerprint = _settings_fingerprint(existing_settings)
+    # Fingerprint is cached at the moment it was last verified readable —
+    # NOT recomputed from existing_settings on every call. A caller that
+    # regenerates its --settings temp file on every restart typically also
+    # deletes its *previous* temp file soon after, so by the time of a later
+    # comparison existing_settings may already point at a file that's gone.
+    # Recomputing from that stale path would hit the "unreadable" fallback
+    # below and permanently mismatch every future request, even when the
+    # actual content never changed — the exact failure this fingerprinting
+    # was meant to fix. Sessions frozen before this field existed have no
+    # cached value yet; migrate them best-effort further down.
+    cached_settings_fingerprint = session.metadata.get("settings_fingerprint")
     existing_permission_mode = session.metadata.get("permission_mode") or "default"
     existing_dev_channels = _bool_metadata(
         session.metadata.get("dangerously_load_development_channels", "True")
@@ -153,8 +159,22 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     existing_disallowed_tools = session.metadata.get("disallowed_tools") or ""
 
     if "launch_config_frozen" in session.metadata:
+        if cached_settings_fingerprint is None:
+            # Migrating a session frozen before settings_fingerprint existed:
+            # best-effort fingerprint whatever's still on record. If that
+            # file is already gone, there's no reliable baseline to compare
+            # against — don't block a legitimate reconnect on an unprovable
+            # historical mismatch, just adopt the incoming content as the
+            # new baseline (this path only runs once per pre-upgrade
+            # session, since the fingerprint gets cached below either way).
+            stale_fingerprint = _settings_fingerprint(existing_settings)
+            cached_settings_fingerprint = (
+                incoming_settings_fingerprint
+                if stale_fingerprint.startswith("unreadable:")
+                else stale_fingerprint
+            )
         mismatches = []
-        if existing_settings_fingerprint != incoming_settings_fingerprint:
+        if cached_settings_fingerprint != incoming_settings_fingerprint:
             mismatches.append(f"settings_path existing={existing_settings!r} incoming={incoming_settings!r}")
         if existing_permission_mode != incoming_permission_mode:
             mismatches.append(
@@ -177,6 +197,11 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
             # (prepare_launch_spec, or the next comparison) doesn't reference
             # a stale path that may no longer exist.
             session.metadata["settings_path"] = incoming_settings
+        # Always keep the cached fingerprint in sync with the incoming
+        # (verified-matching) value — not just existing_settings/path above —
+        # so the NEXT comparison never has to re-read a path that the caller
+        # may have since deleted.
+        session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
         if incoming_resume:
             session.metadata["resume_on_launch"] = "True"
         if existing_auto_trust != incoming_auto_trust:
@@ -213,6 +238,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
 
     session.metadata["resume_on_launch"] = str(incoming_resume)
     session.metadata["settings_path"] = incoming_settings
+    session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
     session.metadata["permission_mode"] = incoming_permission_mode
     session.metadata["dangerously_load_development_channels"] = str(incoming_dev_channels)
     session.metadata["auto_accept_workspace_trust"] = str(incoming_auto_trust)

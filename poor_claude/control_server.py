@@ -170,20 +170,34 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     existing_disallowed_tools = session.metadata.get("disallowed_tools") or ""
 
     if "launch_config_frozen" in session.metadata:
-        if cached_settings_fingerprint is None:
+        # Only a call that actually provides settings_path can need migrating
+        # or trigger a settings-changed restart — skip the (possibly file-I/O)
+        # migration check entirely on a call that omits settings_path, since
+        # settings_changed is gated on settings_provided below regardless.
+        # This also keeps the migration's one-time cost honest: without this
+        # guard, a caller that never resends --settings after the first turn
+        # would re-run the stale-file read on every single request forever.
+        migrated_unprovable = False
+        if settings_provided and cached_settings_fingerprint is None:
             # Migrating a session frozen before settings_fingerprint existed:
             # best-effort fingerprint whatever's still on record. If that
             # file is already gone, there's no reliable baseline to compare
-            # against — don't block a legitimate reconnect on an unprovable
-            # historical mismatch, just adopt the incoming content as the
-            # new baseline (this path only runs once per pre-upgrade
-            # session, since the fingerprint gets cached below either way).
+            # against — don't hard-block a legitimate reconnect on an
+            # unprovable historical mismatch. But settings_path is a SOFT
+            # field now (see below): silently "adopting" the incoming content
+            # as the new baseline without also treating it as a change would
+            # leave the metadata claiming the new settings are in effect while
+            # the live process keeps running under whatever it actually
+            # launched with — an undetectable divergence. So when the old
+            # baseline is unprovable, err toward restarting once during this
+            # migration (self-healing is cheap and safe here) rather than
+            # silently trusting an unverifiable match.
             stale_fingerprint = _settings_fingerprint(existing_settings)
-            cached_settings_fingerprint = (
-                incoming_settings_fingerprint
-                if stale_fingerprint.startswith("unreadable:")
-                else stale_fingerprint
-            )
+            if stale_fingerprint.startswith("unreadable:"):
+                cached_settings_fingerprint = incoming_settings_fingerprint
+                migrated_unprovable = True
+            else:
+                cached_settings_fingerprint = stale_fingerprint
         # settings_path content is a SOFT field (handled below, alongside
         # effort/model/etc.) — a genuine content change triggers a process
         # restart instead of rejecting the request outright. permission_mode
@@ -213,7 +227,9 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
         # froze earlier". Without this guard, that omission would silently
         # wipe settings_path to "" and schedule a restart that drops
         # whatever hooks/permission rules the caller's settings file carried.
-        settings_changed = settings_provided and cached_settings_fingerprint != incoming_settings_fingerprint
+        settings_changed = settings_provided and (
+            migrated_unprovable or cached_settings_fingerprint != incoming_settings_fingerprint
+        )
         if settings_provided:
             if existing_settings != incoming_settings:
                 # Path moved — either a genuine content change (settings_changed,

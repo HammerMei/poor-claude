@@ -1919,6 +1919,61 @@ def test_control_server_migrates_pre_fingerprint_session_when_old_file_readable(
         server.server_close()
 
 
+def test_control_server_migrates_pre_fingerprint_session_when_old_file_unreadable(tmp_path) -> None:
+    """Round 6 finding: when a pre-fingerprint session's OLD settings_path is
+    no longer readable (deleted, exactly as a caller like ACG does with its
+    previous temp file), the migration branch has no reliable baseline to
+    compare against — it adopts the incoming content as the new baseline
+    rather than hard-blocking an unprovable historical mismatch. But because
+    settings_path is now a SOFT field, silently "adopting" that baseline
+    without treating it as a change would leave session metadata claiming
+    the new settings are in effect while the live process keeps running
+    under whatever it actually launched with — an undetectable divergence
+    between metadata and reality. This migration call must still schedule a
+    restart so the new content actually reaches the process, not silently
+    swallow a genuine settings change."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        first_settings = tmp_path / "one.json"
+        second_settings = tmp_path / "two.json"
+        first_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(first_settings)},
+        )
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            del session.metadata["settings_fingerprint"]  # simulate a pre-upgrade session
+        # Simulate the caller cleaning up its own old temp file, then sending
+        # genuinely different content at a new path — exactly the ACG restart
+        # pattern, but landing on a session that's ALSO mid-migration.
+        first_settings.unlink()
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+        result = request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(second_settings)},
+        )
+        assert result.get("warnings") is None
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            assert session.metadata["restart_needed"] == "True", (
+                "an unprovable migration must still restart, not silently adopt the new content as a no-op"
+            )
+            assert session.metadata["resume_on_launch"] == "True"
+            assert session.metadata["settings_path"] == str(second_settings)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_schedules_restart_on_settings_content_change(tmp_path) -> None:
     """Content still matters: if the new path's content genuinely differs,
     it must still be treated as a real change — the fingerprint fix must not

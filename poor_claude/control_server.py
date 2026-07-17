@@ -88,8 +88,19 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     Returns a list of warning strings for mismatches that are ignored (not fatal).
     """
     _VALID_PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
-    incoming_settings = payload.get("settings_path")
-    incoming_settings = incoming_settings if isinstance(incoming_settings, str) else ""
+    # Distinguish "caller explicitly passed a settings_path" from "omitted/null"
+    # — the CLI resends its full launch config on every invocation, so a
+    # caller that only passed --settings on the first turn of a conversation
+    # would otherwise have this omission read as "explicitly clear my
+    # settings", silently wiping (and restarting on) a previously-frozen
+    # settings file instead of leaving it untouched. Unlike the other soft
+    # fields (effort/model/etc.), settings_path can carry security-relevant
+    # content (custom hooks, permission rules) that used to be protected by
+    # the old hard-reject check — that protection must not regress just
+    # because the field became soft.
+    raw_settings = payload.get("settings_path")
+    settings_provided = isinstance(raw_settings, str)
+    incoming_settings = raw_settings if settings_provided else ""
     incoming_settings_fingerprint = _settings_fingerprint(incoming_settings)
     # --dangerously-skip-permissions is a legacy alias for --permission-mode bypassPermissions
     incoming_permission_mode = payload.get("permission_mode") or (
@@ -194,21 +205,30 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
                 "existing session launch config differs from request; stop/recreate session or use matching flags: "
                 + "; ".join(mismatches)
             )
-        settings_changed = cached_settings_fingerprint != incoming_settings_fingerprint
-        if existing_settings != incoming_settings:
-            # Path moved — either a genuine content change (settings_changed,
-            # triggers a soft restart below so the new content actually reaches
-            # the relaunched process) or just a caller regenerating its temp
-            # settings file at a new path with identical content. Either way,
-            # track the new path so a later re-read (prepare_launch_spec, or
-            # the next comparison) doesn't reference a stale path that may no
-            # longer exist.
-            session.metadata["settings_path"] = incoming_settings
-        # Always keep the cached fingerprint in sync with the incoming
-        # (verified) value — not just existing_settings/path above — so the
-        # NEXT comparison never has to re-read a path that the caller may
-        # have since deleted.
-        session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
+        # Only compare/update settings when the caller actually provided a
+        # settings_path this call. An omitted/null value on a follow-up
+        # request means "no opinion" (matches the CLI resending its full
+        # launch config every invocation, sometimes without --settings after
+        # the first turn) — it must NOT be read as "clear the settings I
+        # froze earlier". Without this guard, that omission would silently
+        # wipe settings_path to "" and schedule a restart that drops
+        # whatever hooks/permission rules the caller's settings file carried.
+        settings_changed = settings_provided and cached_settings_fingerprint != incoming_settings_fingerprint
+        if settings_provided:
+            if existing_settings != incoming_settings:
+                # Path moved — either a genuine content change (settings_changed,
+                # triggers a soft restart below so the new content actually reaches
+                # the relaunched process) or just a caller regenerating its temp
+                # settings file at a new path with identical content. Either way,
+                # track the new path so a later re-read (prepare_launch_spec, or
+                # the next comparison) doesn't reference a stale path that may no
+                # longer exist.
+                session.metadata["settings_path"] = incoming_settings
+            # Always keep the cached fingerprint in sync with the incoming
+            # (verified) value — not just existing_settings/path above — so the
+            # NEXT comparison never has to re-read a path that the caller may
+            # have since deleted.
+            session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
         if incoming_resume:
             session.metadata["resume_on_launch"] = "True"
         if existing_auto_trust != incoming_auto_trust:

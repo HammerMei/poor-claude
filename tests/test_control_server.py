@@ -1635,6 +1635,159 @@ def test_control_server_restarts_on_settings_change_via_requests_path(tmp_path) 
         server.server_close()
 
 
+def test_control_server_settings_change_combined_with_hard_mismatch_still_rejects_cleanly(tmp_path) -> None:
+    """Round 5 gap: no test previously covered a request that changes BOTH a
+    soft field (settings_path content) and a hard field (permission_mode) at
+    once. The hard mismatch must still raise, and — this is the part a test
+    is needed for — settings_path/settings_fingerprint metadata must NOT be
+    partially mutated as a side effect before the raise. This function has
+    already had two broken rewrites this session (082cb18, then the
+    stale-fingerprint follow-up); locking in "the raise happens strictly
+    before any metadata mutation" guards against a third."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        first_settings = tmp_path / "one.json"
+        second_settings = tmp_path / "two.json"
+        first_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {
+                "session_id": "demo",
+                "workdir": str(tmp_path),
+                "settings_path": str(first_settings),
+                "permission_mode": "default",
+            },
+        )
+        try:
+            request_json(
+                "POST",
+                f"{address}/sessions",
+                {
+                    "session_id": "demo",
+                    "workdir": str(tmp_path),
+                    "settings_path": str(second_settings),
+                    "permission_mode": "bypassPermissions",
+                },
+            )
+        except HttpClientError as exc:
+            assert "existing session launch config differs" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected permission_mode mismatch to still raise")
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            # Rejected request must leave the settings metadata exactly as it
+            # was before the call — no partial mutation from the field that
+            # would have been a no-op restart had the hard field not rejected.
+            assert session.metadata["settings_path"] == str(first_settings)
+            assert session.metadata.get("restart_needed") is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_settings_change_deferred_while_request_active(tmp_path) -> None:
+    """Round 5 gap: the prior /requests-path propagation test only exercised
+    the sequential (idle-session) case. Confirm the pre-existing busy-guard
+    (unchanged by this diff, already used for effort/model soft changes)
+    correctly defers a settings-triggered restart while a request is
+    genuinely active — raising "session is busy" rather than killing the
+    in-flight process — and that a later request still picks up the deferred
+    restart once the session is idle again."""
+    state = ControlState()
+    fake_process = FakeProcess()
+    state.process_manager._launch_fn = lambda _spec: fake_process
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    state.callback_base_url = address
+    try:
+        first_settings = tmp_path / "one.json"
+        second_settings = tmp_path / "two.json"
+        first_settings.write_text('{"hooks": {}}', encoding="utf-8")
+        second_settings.write_text('{"hooks": {"Stop": []}}', encoding="utf-8")
+
+        # Launch the session and leave a request genuinely active (never
+        # completed) by not sending a matching /hook/stop.
+        result_box: dict = {}
+
+        def send_first() -> None:
+            result_box["first"] = request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "hello",
+                    "timeout_seconds": 5,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": True,
+                    "launch_process": True,
+                    "settings_path": str(first_settings),
+                },
+            )
+
+        t1 = threading.Thread(target=send_first)
+        t1.start()
+        deadline = time.monotonic() + 3
+        listed = None
+        while time.monotonic() < deadline:
+            listed = request_json("GET", f"{address}/sessions")
+            if listed["sessions"] and listed["sessions"][0]["active_request"] is not None:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("first request never became active")
+        active_request = listed["sessions"][0]["active_request"]
+
+        # While request 1 is still active, a second request carrying a
+        # genuine settings content change must be deferred, not silently
+        # kill the process out from under request 1.
+        try:
+            request_json(
+                "POST",
+                f"{address}/requests",
+                {
+                    "session_id": "demo",
+                    "prompt": "hello again",
+                    "timeout_seconds": 5,
+                    "workdir": str(tmp_path),
+                    "wait_for_response": False,
+                    "launch_process": True,
+                    "settings_path": str(second_settings),
+                },
+            )
+        except HttpClientError as exc:
+            assert "session is busy" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected settings-triggered restart to be deferred while busy")
+        assert fake_process.terminated is False, "process must not be killed out from under the active request"
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            assert session.metadata["restart_needed"] == "True", "restart must stay scheduled for later"
+
+        # Complete request 1; the deferred restart isn't retried automatically
+        # (no request is pending for it to piggyback on), matching the
+        # existing effort/model soft-restart contract.
+        request_json(
+            "POST",
+            f"{address}/hook/stop",
+            {"session_id": "demo", "request_id": active_request, "response": "hi", "cwd": str(tmp_path)},
+        )
+        t1.join(timeout=3)
+        assert result_box["first"]["status"] == "completed"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_control_server_allows_settings_path_change_with_identical_content(tmp_path) -> None:
     """Regression test: a caller that regenerates its --settings file at a new
     path on every restart (e.g. a fresh temp file with a random suffix) must
@@ -1803,6 +1956,59 @@ def test_control_server_schedules_restart_on_settings_content_change(tmp_path) -
             assert session.metadata["restart_needed"] == "True"
             assert session.metadata["resume_on_launch"] == "True"
             assert session.metadata["settings_path"] == str(second_settings)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_control_server_omitted_settings_path_preserves_frozen_settings(tmp_path) -> None:
+    """Round 5 finding: the CLI resends its full launch config on every
+    invocation (a fresh process each time), so a caller that only passed
+    --settings on the first turn of a conversation would omit it on every
+    later turn. Before settings_path became a soft field, an omitted value
+    (None -> "") would mismatch the frozen path/fingerprint and raise a loud
+    "config differs" error — the caller's settings were protected. Making
+    settings_path soft accidentally REMOVED that protection: an omitted
+    value silently wiped settings_path to "" and scheduled a restart that
+    would drop the caller's hooks/permission rules with no warning. Unlike
+    the other soft fields (effort omitted -> "medium" is a quality knob that
+    never had protection to lose), settings_path can carry security-relevant
+    content, so this omission must be treated as "no opinion, keep what's
+    frozen" rather than "explicitly clear it"."""
+    state = ControlState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        settings_path = tmp_path / "acg-claude-settings-thpg3ii3.json"
+        settings_path.write_text(
+            '{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", '
+            '"command": "curl http://127.0.0.1:9999/hook"}]}]}}',
+            encoding="utf-8",
+        )
+        request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path), "settings_path": str(settings_path)},
+        )
+        # Second turn omits settings_path entirely, exactly like cli.py would
+        # if the caller only passed --settings on the first invocation.
+        result = request_json(
+            "POST",
+            f"{address}/sessions",
+            {"session_id": "demo", "workdir": str(tmp_path)},
+        )
+        assert result.get("warnings") is None
+        with state.lock:
+            session = state.registry.get("demo", workdir=str(tmp_path))
+            assert session is not None
+            assert session.metadata["settings_path"] == str(settings_path), (
+                "omitting settings_path on a follow-up call must not clear the frozen settings"
+            )
+            assert session.metadata.get("restart_needed") is None, (
+                "omitting settings_path must not be read as a content change that needs a restart"
+            )
     finally:
         server.shutdown()
         server.server_close()

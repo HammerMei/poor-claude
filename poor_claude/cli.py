@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import uuid
+from pathlib import Path
 
 from poor_claude.compat import stream_json_lines
 from poor_claude.config import resolve_timeout, resolve_ttl
@@ -159,6 +160,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.shutdown:
             state = discover_state(state_path)
             if state is None:
+                # discover_state() also returns None when the state file exists
+                # but is corrupt/unparseable — that case is NOT "no daemon ever
+                # ran," it's "we can't tell," and a daemon may still be alive
+                # and serving. On main, this case raised an uncaught exception
+                # (exit 1); restore that "not a clean confirmed stop" signal
+                # for scripts that gate on the exit code instead of stderr.
+                if Path(state_path).exists():
+                    print(
+                        f"warning: {state_path} exists but could not be read; "
+                        "unable to confirm whether a daemon is still running",
+                        file=sys.stderr,
+                    )
+                    return 1
                 return 0
             request_json("POST", f"{state.address}/shutdown", {})
             return 0

@@ -206,7 +206,22 @@ def read_settings(path_or_json: str | None) -> dict:
     candidate = Path(path_or_json).expanduser()
     if candidate.exists():
         return json.loads(candidate.read_text(encoding="utf-8"))
-    return json.loads(path_or_json)
+    # Not an existing file — the caller may have meant to pass raw JSON
+    # directly instead of a path (a legitimate, tested mode; see
+    # test_read_settings_accepts_file_or_json). But this is also exactly
+    # what happens when a session's settings_path metadata refers to a file
+    # that existed when frozen/cached but has since been deleted by the
+    # caller — in that case json.loads on the path string itself always
+    # fails, but with a cryptic "Expecting value: line 1 column 1 (char 0)"
+    # that gives no hint the real problem is a missing file. Re-raise with
+    # a message that names the actual value, so a caller/operator debugging
+    # a wedged session isn't left guessing.
+    try:
+        return json.loads(path_or_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"settings value is neither an existing file nor valid JSON: {path_or_json!r}"
+        ) from exc
 
 
 def merge_settings(base: dict, poor_claude_settings: dict) -> dict:

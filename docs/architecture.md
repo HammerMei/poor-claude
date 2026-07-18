@@ -74,7 +74,6 @@ must stop and recreate the session to change these.
 
 | Parameter | Reason |
 |---|---|
-| `settings_path` | Affects which settings file is loaded at launch |
 | `permission_mode` | Determines hook injection and Claude's built-in permission behavior |
 | `dangerously_load_development_channels` | Required for MCP Channel routing |
 
@@ -84,6 +83,7 @@ Changing a soft param stops the running Claude process and restarts it with
 
 | Parameter | |
 |---|---|
+| `settings_path` | Compared by SHA-256 content fingerprint, not path string — a caller regenerating its `--settings` file at a new path with unchanged content is a no-op, but a genuine content change (e.g. a hook callback URL) restarts the process so the new settings actually take effect. Omitting `settings_path` on a follow-up request means "no opinion" and preserves whatever is frozen — it does not clear it. |
 | `effort` | Passed as `--effort` to the claude command |
 | `model` | Passed as `--model` |
 | `system_prompt` | Passed as `--system-prompt` |

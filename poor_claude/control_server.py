@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from poor_claude.daemon import DaemonState, write_state
+from poor_claude.daemon import DaemonState, read_state, write_state
 from poor_claude.launcher import build_claude_command, cleanup_project_mcp_config, prepare_launch_spec
 from poor_claude.mcp_router import McpRouter
 from poor_claude.process_manager import ProcessManager
@@ -58,14 +59,49 @@ def _canonical_session_id(value: Any) -> str | None:
         return value
 
 
+def _settings_fingerprint(path_str: str) -> str:
+    """Fingerprint a --settings file by its content, not its path.
+
+    Some callers (e.g. a client that regenerates a temp settings file at a
+    new random path every time it restarts) pass a different path on every
+    request even when the file's actual contents haven't changed. Comparing
+    raw path strings then falsely flags this as a launch-config change and
+    rejects an otherwise-identical request against an already-running
+    session. Hashing the content instead means only a real settings change
+    trips the mismatch check in _apply_launch_metadata().
+    """
+    if not path_str:
+        return ""
+    try:
+        content = Path(path_str).read_bytes()
+    except OSError:
+        # Unreadable/missing file: fall back to the path itself so this
+        # still participates in mismatch detection instead of silently
+        # matching every unreadable path against every other one.
+        return f"unreadable:{path_str}"
+    return hashlib.sha256(content).hexdigest()
+
+
 def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     """Record immutable launch-affecting metadata for a session route.
 
     Returns a list of warning strings for mismatches that are ignored (not fatal).
     """
     _VALID_PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
-    incoming_settings = payload.get("settings_path")
-    incoming_settings = incoming_settings if isinstance(incoming_settings, str) else ""
+    # Distinguish "caller explicitly passed a settings_path" from "omitted/null"
+    # — the CLI resends its full launch config on every invocation, so a
+    # caller that only passed --settings on the first turn of a conversation
+    # would otherwise have this omission read as "explicitly clear my
+    # settings", silently wiping (and restarting on) a previously-frozen
+    # settings file instead of leaving it untouched. Unlike the other soft
+    # fields (effort/model/etc.), settings_path can carry security-relevant
+    # content (custom hooks, permission rules) that used to be protected by
+    # the old hard-reject check — that protection must not regress just
+    # because the field became soft.
+    raw_settings = payload.get("settings_path")
+    settings_provided = isinstance(raw_settings, str)
+    incoming_settings = raw_settings if settings_provided else ""
+    incoming_settings_fingerprint = _settings_fingerprint(incoming_settings)
     # --dangerously-skip-permissions is a legacy alias for --permission-mode bypassPermissions
     incoming_permission_mode = payload.get("permission_mode") or (
         "bypassPermissions" if payload.get("dangerously_skip_permissions") else "default"
@@ -108,6 +144,17 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
         raise RuntimeError("poor-claude requires development channels for interactive routing")
 
     existing_settings = session.metadata.get("settings_path", "")
+    # Fingerprint is cached at the moment it was last verified readable —
+    # NOT recomputed from existing_settings on every call. A caller that
+    # regenerates its --settings temp file on every restart typically also
+    # deletes its *previous* temp file soon after, so by the time of a later
+    # comparison existing_settings may already point at a file that's gone.
+    # Recomputing from that stale path would hit the "unreadable" fallback
+    # below and permanently mismatch every future request, even when the
+    # actual content never changed — the exact failure this fingerprinting
+    # was meant to fix. Sessions frozen before this field existed have no
+    # cached value yet; migrate them best-effort further down.
+    cached_settings_fingerprint = session.metadata.get("settings_fingerprint")
     existing_permission_mode = session.metadata.get("permission_mode") or "default"
     existing_dev_channels = _bool_metadata(
         session.metadata.get("dangerously_load_development_channels", "True")
@@ -123,9 +170,41 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
     existing_disallowed_tools = session.metadata.get("disallowed_tools") or ""
 
     if "launch_config_frozen" in session.metadata:
+        # Only a call that actually provides settings_path can need migrating
+        # or trigger a settings-changed restart — skip the (possibly file-I/O)
+        # migration check entirely on a call that omits settings_path, since
+        # settings_changed is gated on settings_provided below regardless.
+        # This also keeps the migration's one-time cost honest: without this
+        # guard, a caller that never resends --settings after the first turn
+        # would re-run the stale-file read on every single request forever.
+        migrated_unprovable = False
+        if settings_provided and cached_settings_fingerprint is None:
+            # Migrating a session frozen before settings_fingerprint existed:
+            # best-effort fingerprint whatever's still on record. If that
+            # file is already gone, there's no reliable baseline to compare
+            # against — don't hard-block a legitimate reconnect on an
+            # unprovable historical mismatch. But settings_path is a SOFT
+            # field now (see below): silently "adopting" the incoming content
+            # as the new baseline without also treating it as a change would
+            # leave the metadata claiming the new settings are in effect while
+            # the live process keeps running under whatever it actually
+            # launched with — an undetectable divergence. So when the old
+            # baseline is unprovable, err toward restarting once during this
+            # migration (self-healing is cheap and safe here) rather than
+            # silently trusting an unverifiable match.
+            stale_fingerprint = _settings_fingerprint(existing_settings)
+            if stale_fingerprint.startswith("unreadable:"):
+                cached_settings_fingerprint = incoming_settings_fingerprint
+                migrated_unprovable = True
+            else:
+                cached_settings_fingerprint = stale_fingerprint
+        # settings_path content is a SOFT field (handled below, alongside
+        # effort/model/etc.) — a genuine content change triggers a process
+        # restart instead of rejecting the request outright. permission_mode
+        # and dangerously_load_development_channels stay HARD: those are
+        # security-relevant and must not silently change under a live
+        # session, so a mismatch there still raises.
         mismatches = []
-        if existing_settings != incoming_settings:
-            mismatches.append(f"settings_path existing={existing_settings!r} incoming={incoming_settings!r}")
         if existing_permission_mode != incoming_permission_mode:
             mismatches.append(
                 f"permission_mode existing={existing_permission_mode!r} incoming={incoming_permission_mode!r}"
@@ -140,6 +219,32 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
                 "existing session launch config differs from request; stop/recreate session or use matching flags: "
                 + "; ".join(mismatches)
             )
+        # Only compare/update settings when the caller actually provided a
+        # settings_path this call. An omitted/null value on a follow-up
+        # request means "no opinion" (matches the CLI resending its full
+        # launch config every invocation, sometimes without --settings after
+        # the first turn) — it must NOT be read as "clear the settings I
+        # froze earlier". Without this guard, that omission would silently
+        # wipe settings_path to "" and schedule a restart that drops
+        # whatever hooks/permission rules the caller's settings file carried.
+        settings_changed = settings_provided and (
+            migrated_unprovable or cached_settings_fingerprint != incoming_settings_fingerprint
+        )
+        if settings_provided:
+            if existing_settings != incoming_settings:
+                # Path moved — either a genuine content change (settings_changed,
+                # triggers a soft restart below so the new content actually reaches
+                # the relaunched process) or just a caller regenerating its temp
+                # settings file at a new path with identical content. Either way,
+                # track the new path so a later re-read (prepare_launch_spec, or
+                # the next comparison) doesn't reference a stale path that may no
+                # longer exist.
+                session.metadata["settings_path"] = incoming_settings
+            # Always keep the cached fingerprint in sync with the incoming
+            # (verified) value — not just existing_settings/path above — so the
+            # NEXT comparison never has to re-read a path that the caller may
+            # have since deleted.
+            session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
         if incoming_resume:
             session.metadata["resume_on_launch"] = "True"
         if existing_auto_trust != incoming_auto_trust:
@@ -152,8 +257,13 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
             session.metadata["allowed_tools"] = incoming_allowed_tools
         if existing_disallowed_tools != incoming_disallowed_tools:
             session.metadata["disallowed_tools"] = incoming_disallowed_tools
-        # Soft params (effort, model, system_prompt, append_system_prompt) require a
-        # process restart so the new values are included in the claude command arguments.
+        # Soft params (effort, model, system_prompt, append_system_prompt, and now
+        # settings content) require a process restart so the new values are
+        # included in the claude command arguments / merged settings file. This
+        # is what lets a session self-heal from a caller-side infra change (e.g.
+        # ACG regenerating its settings file with a new permission-hook port on
+        # restart) instead of every subsequent request failing with a hard
+        # "config mismatch" until the session is manually recreated.
         soft_changed = (
             existing_effort != incoming_effort
             or existing_model != incoming_model
@@ -161,6 +271,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
             or existing_add_dirs != incoming_add_dirs
             or existing_system_prompt != incoming_system_prompt
             or existing_append_system_prompt != incoming_append_system_prompt
+            or settings_changed
         )
         if soft_changed:
             session.metadata["effort"] = incoming_effort
@@ -176,6 +287,7 @@ def _apply_launch_metadata(session, payload: dict[str, Any]) -> list[str]:
 
     session.metadata["resume_on_launch"] = str(incoming_resume)
     session.metadata["settings_path"] = incoming_settings
+    session.metadata["settings_fingerprint"] = incoming_settings_fingerprint
     session.metadata["permission_mode"] = incoming_permission_mode
     session.metadata["dangerously_load_development_channels"] = str(incoming_dev_channels)
     session.metadata["auto_accept_workspace_trust"] = str(incoming_auto_trust)
@@ -1533,6 +1645,25 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
+def _safe_to_delete_state_file(state_file: Path, pid: int) -> bool:
+    """False only when state_file positively records a different, valid pid.
+
+    True for a missing, corrupt/unparseable, or self-owned file: corruption
+    is always safe to clear because write_state() is atomic (tmp-file +
+    rename), so a live daemon never leaves behind a torn/corrupt file — an
+    unparseable file was never a valid owner's record in the first place.
+    False is the one case that matters: a different, valid daemon record —
+    e.g. this process was an orphaned duplicate from a startup race — must
+    not be deleted out from under the daemon that's actually alive and
+    serving requests.
+    """
+    try:
+        current = read_state(state_file)
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    return current is None or current.pid == pid
+
+
 def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     state = ControlState(state_dir=state_file.parent)
     server = _FastBindHTTPServer((host, port), make_handler(state))
@@ -1543,7 +1674,8 @@ def serve(*, state_file: Path, host: str = "127.0.0.1", port: int = 0) -> int:
     write_state(state_file, DaemonState(pid=os.getpid(), address=address))
 
     def remove_state(*_: object) -> None:
-        state_file.unlink(missing_ok=True)
+        if _safe_to_delete_state_file(state_file, os.getpid()):
+            state_file.unlink(missing_ok=True)
 
     shutdown_signal = threading.Event()
 

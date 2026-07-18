@@ -132,6 +132,25 @@ def test_read_settings_accepts_file_or_json(tmp_path) -> None:
     assert read_settings('{"permissions": {}}') == {"permissions": {}}
 
 
+def test_read_settings_raises_clear_error_for_deleted_file(tmp_path) -> None:
+    """Regression test: a settings_path that pointed to a real file when
+    frozen/cached, but whose file has since been deleted, used to fail with a
+    cryptic 'Expecting value: line 1 column 1 (char 0)' (json.loads trying to
+    parse the path string itself as JSON, since the path no longer exists as
+    a file). Must instead raise a message that names the actual value, so a
+    caller debugging a wedged session isn't left guessing."""
+    path = tmp_path / "settings.json"
+    path.write_text('{"hooks": {}}', encoding="utf-8")
+    path.unlink()
+    try:
+        read_settings(str(path))
+    except ValueError as exc:
+        assert str(path) in str(exc)
+        assert "neither an existing file nor valid JSON" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected a clear ValueError for a deleted settings file")
+
+
 def test_write_merged_settings_writes_unique_local_file(tmp_path) -> None:
     base_path = tmp_path / "base.json"
     base_path.write_text(

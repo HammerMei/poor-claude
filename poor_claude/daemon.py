@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -45,7 +46,17 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def discover_state(path: Path) -> DaemonState | None:
-    state = read_state(path)
+    try:
+        state = read_state(path)
+    except (OSError, ValueError, KeyError, TypeError):
+        # Unparseable state file: treat like "no daemon" rather than crashing
+        # every caller (e.g. start_daemon()). Deliberately do NOT unlink here —
+        # this runs with no lock held, so deleting could race a concurrent
+        # daemon's just-written, valid state (the same class of bug the
+        # start_daemon() flock and _safe_to_delete_state_file() guard against
+        # elsewhere). Leaving it is harmless: the next successful spawn's
+        # write_state() atomically overwrites it anyway.
+        return None
     if state is None:
         return None
     if not is_pid_alive(state.pid):
@@ -65,33 +76,53 @@ def start_daemon(*, state_path: Path | None = None, timeout_seconds: float = 30.
     daemon writes its state file AND its HTTP server responds to /healthz.
     Uses a generous default timeout because Python cold-start (first import of
     the module tree) can take several seconds on some machines.
+
+    Concurrent callers (e.g. several routes starting up around the same time)
+    serialize on a lock file so only one of them ever spawns a daemon process;
+    the rest just discover the winner's state once it's up. Without this lock,
+    every caller that observes "no daemon yet" spawns its own, and the
+    resulting daemons race each other for the same routes.
     """
     path = default_state_path() if state_path is None else state_path
     existing = _discover_and_verify(path)
     if existing is not None:
         return existing
 
-    command = [
-        sys.executable,
-        "-m",
-        "poor_claude.control_server",
-        "--state-file",
-        str(path),
-    ]
-    subprocess.Popen(  # noqa: S603 - launches this package's daemon module
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # Re-check now that we hold the lock: another process may have
+            # already spawned (and this one may already be healthy) while we
+            # were waiting for it.
+            existing = _discover_and_verify(path)
+            if existing is not None:
+                return existing
 
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        state = _discover_and_verify(path)
-        if state is not None:
-            return state
-        time.sleep(0.1)
-    raise TimeoutError("timed out waiting for poor-claude daemon to start")
+            command = [
+                sys.executable,
+                "-m",
+                "poor_claude.control_server",
+                "--state-file",
+                str(path),
+            ]
+            subprocess.Popen(  # noqa: S603 - launches this package's daemon module
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                state = _discover_and_verify(path)
+                if state is not None:
+                    return state
+                time.sleep(0.1)
+            raise TimeoutError("timed out waiting for poor-claude daemon to start")
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _discover_and_verify(path: Path) -> DaemonState | None:

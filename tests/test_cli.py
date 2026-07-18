@@ -169,8 +169,13 @@ def test_format_sessions_handles_empty_list() -> None:
     assert cli._format_sessions([]) == "No active sessions."
 
 
-def test_cli_shutdown_returns_zero_when_daemon_missing(monkeypatch) -> None:
-    monkeypatch.setattr(cli, "default_state_path", lambda: "/tmp/daemon.json")
+def test_cli_shutdown_returns_zero_when_daemon_missing(tmp_path, monkeypatch) -> None:
+    # Use tmp_path (guaranteed not to exist) rather than a hardcoded shared
+    # path — this test asserts the "no daemon ever ran" case specifically,
+    # and a hardcoded path could coincidentally exist on some machine/CI
+    # worker and silently exercise the corrupt-file warning branch instead.
+    state_path = tmp_path / "daemon.json"
+    monkeypatch.setattr(cli, "default_state_path", lambda: state_path)
     monkeypatch.setattr(cli, "discover_state", lambda _path: None)
     assert cli.main(["--shutdown"]) == 0
 
@@ -182,6 +187,32 @@ def test_cli_shutdown_posts_to_daemon(monkeypatch) -> None:
     monkeypatch.setattr(cli, "request_json", lambda method, url, payload=None, **kwargs: calls.append((method, url, payload)))
     assert cli.main(["--shutdown"]) == 0
     assert calls == [("POST", "http://daemon/shutdown", {})]
+
+
+def test_cli_shutdown_warns_when_state_file_corrupt(tmp_path, monkeypatch, capsys) -> None:
+    """Regression test: discover_state() returns None both when no daemon has
+    ever run AND when the state file exists but is unparseable (a daemon may
+    still be alive). --shutdown must not silently claim success in the second
+    case — it should warn that it couldn't confirm the daemon is actually
+    stopped, and exit nonzero (matching main's pre-self-heal behavior, where
+    this case raised an uncaught exception instead of returning 0) so scripts
+    gating on the exit code don't mistake this for a confirmed clean stop."""
+    state_path = tmp_path / "daemon.json"
+    state_path.write_text("not valid json", encoding="utf-8")
+    monkeypatch.setattr(cli, "default_state_path", lambda: state_path)
+    monkeypatch.setattr(cli, "discover_state", lambda _path: None)
+    assert cli.main(["--shutdown"]) == 1
+    assert "unable to confirm" in capsys.readouterr().err
+
+
+def test_cli_shutdown_no_warning_when_state_file_absent(tmp_path, monkeypatch, capsys) -> None:
+    """The legitimate 'no daemon ever ran' case (no state file at all) must
+    not print the corrupt-file warning."""
+    state_path = tmp_path / "daemon.json"
+    monkeypatch.setattr(cli, "default_state_path", lambda: state_path)
+    monkeypatch.setattr(cli, "discover_state", lambda _path: None)
+    assert cli.main(["--shutdown"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_cli_sessions_prints_json(monkeypatch, capsys) -> None:
